@@ -5,5 +5,5 @@ cache
 **/__pycache__
 *.parquet
 *.nc
-*.parquet
+**/*.parquet
 artifacts/predictions/predictions_2023.parquet
