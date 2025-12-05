@@ -1,0 +1,9 @@
+catboost_info
+climate_data
+eda_output
+cache
+**/__pycache__
+*.parquet
+*.nc
+*.parquet
+artifacts/predictions/predictions_2023.parquet
