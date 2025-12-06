@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 # Configuration
-DATA_FILE = "features_2017.nc"
+DATA_FILE = "climate_data/features/features_2024.nc"
 OUTPUT_DIR = Path("eda_output/single_day_maps")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 

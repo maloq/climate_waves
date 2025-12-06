@@ -16,7 +16,7 @@ plt.style.use('seaborn-v0_8-whitegrid')
 sns.set_palette("husl")
 
 # Configuration
-DATA_FILE = "climate_data/features/features_2017.nc"
+DATA_FILE = "climate_data/features/features_2024.nc"
 OUTPUT_DIR = Path("eda_output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 

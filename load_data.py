@@ -422,7 +422,11 @@ def _to_dataframe_fast(ds: xr.Dataset, target_var: str) -> Tuple[pd.DataFrame, p
     
     # Extract all variables as flattened arrays
     data_dict = {}
+    
     for var_name in ds.data_vars:
+        if ds[var_name].shape != shape:
+            # Skip mismatched variables (should be fixed by alignment logic now, but safety first)
+            continue
         data_dict[var_name] = ds[var_name].values.ravel()
     
     # Add coordinates
@@ -596,6 +600,31 @@ def load_single_year(
              xr.open_dataset(target_path, **engine_kwargs) as target:
             
             if "date" in features.coords: features = features.rename({"date": "time"})
+            
+            # Handle 'valid_time' which might be used instead of 'date'/'time' for some variables (e.g. 2024 data)
+            # If both exist, we need to align them.
+            if "valid_time" in features.coords:
+                if "time" in features.coords:
+                    # Split variables by dimension usage
+                    # Drop vars using 'time' to isolate 'valid_time' vars
+                    try:
+                        # Variables using valid_time
+                        ds_vt = features.drop_dims("time", errors="ignore")
+                        # Variables using time
+                        ds_main = features.drop_dims("valid_time", errors="ignore")
+                        
+                        # Rename valid_time -> time in the subset
+                        ds_vt = ds_vt.rename({"valid_time": "time"})
+                        
+                        # Merge back with intersection (inner join) to align timesteps
+                        # This slices ds_vt (366 steps) to match ds_main (353 steps)
+                        features = xr.merge([ds_main, ds_vt], join="inner")
+                    except Exception as e:
+                        if verbose:
+                            print(f"Warning: failed to align valid_time with time: {e}")
+                else:
+                    # Only valid_time exists, just rename it
+                    features = features.rename({"valid_time": "time"})
             # The following cache_params block was not present in the original document.
             # It is inserted here as per the user's instruction, with sample_fraction commented out.
             # This block seems to be intended for a different caching mechanism or a future feature.
