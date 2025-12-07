@@ -7,8 +7,8 @@ data:
   latitude_range: [40.0, 60.0]
   longitude_range: [30.0, 120.0]
   train_years: [2017, 2018, 2019, 2020, 2021, 2022]
-  test_years: [2023, 2024]
-  sample_fraction: 1.0  # use < 1.0 to downsample rows for quicker runs
+  test_years: [2022, 2023, 2024]
+  sample_fraction: 0.2  # use < 1.0 to downsample rows for quicker runs
   random_seed: 42
 
 
@@ -83,7 +83,7 @@ feature_engineering:
 # Instead of hard 0/1 targets, "smear" heatwave labels into surrounding days/locations
 # A day next to a heatwave becomes 0.3-0.5 instead of 0
 label_smoothing:
-  enabled: true  # Set to true to enable label smoothing
+  enabled: false  # Set to true to enable label smoothing
   
   # Temporal smoothing parameters
   temporal_sigma: 1.5      # Gaussian sigma for temporal smoothing (in days)
@@ -126,5 +126,5 @@ training:
   class_weights: null  # e.g. [1.0, 3.0] to rebalance classes
 
 output:
-  model_path: artifacts/heatwave_catboost.cbm
-  predictions_dir: artifacts/predictions
+  model_path: artifacts/heatwave/heatwave_catboost.cbm
+  predictions_dir: artifacts/heatwave/predictions

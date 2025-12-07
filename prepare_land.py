@@ -505,8 +505,8 @@ def landsea_distance(
     import numpy as np
 
     # Path to the land-sea mask and the pre-calculated distance maps
-    mask_path = "data/land_features/IMERG_land_sea_mask.nc"
-    dist_path = "data/land_features/IMERG_land_sea_mask_distances.nc"
+    mask_path = "climate_data/land_data/IMERG_land_sea_mask.nc"
+    dist_path = "climate_data/land_data/IMERG_land_sea_mask_distances.nc"
     feature_names = ["distance_to_coast_km", "distance_to_coast_dilated_km"]
 
     if os.path.exists(dist_path):

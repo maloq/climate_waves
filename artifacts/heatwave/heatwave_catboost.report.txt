@@ -4,10 +4,10 @@ Decision threshold: 0.512
               precision    recall  f1-score   support
 
            0       0.98      0.93      0.96   8670268
-           1       0.49      0.79      0.60    733637
+           1       0.49      0.79      0.61    733637
 
     accuracy                           0.92   9403905
-   macro avg       0.73      0.86      0.78   9403905
+   macro avg       0.74      0.86      0.78   9403905
 weighted avg       0.94      0.92      0.93   9403905
 
 ============================================================
@@ -18,8 +18,8 @@ Decision threshold: 0.512
               precision    recall  f1-score   support
 
            0       0.95      0.91      0.93   2155964
-           1       0.33      0.52      0.41    195013
+           1       0.34      0.52      0.41    195013
 
-    accuracy                           0.87   2350977
-   macro avg       0.64      0.71      0.67   2350977
-weighted avg       0.90      0.87      0.89   2350977
+    accuracy                           0.88   2350977
+   macro avg       0.65      0.71      0.67   2350977
+weighted avg       0.90      0.88      0.89   2350977

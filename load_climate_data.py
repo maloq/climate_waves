@@ -2,131 +2,190 @@ from __future__ import annotations
 
 import os
 import glob
-import re
 import pathlib
-import time as time_lib
-from typing import Dict, Iterable, List, Tuple, Union
+import gc
 import numpy as np
 import pandas as pd
 import xarray as xr
-import yaml
-from feature_engineering import engineer_features, get_feature_names
+from typing import Dict, Iterable, Tuple, List, Union
 
-# Reuse some helper functions from load_data.py if possible, or reimplement
-from load_data import _subset_region, _to_dataframe_fast, load_config, apply_label_smoothing
+import hashlib
+import json
+import shutil
+import time
 
-def find_climate_files(climate_data_dir: str, variable: str):
-    """
-    Return (file_list, variable_dir) for *variable*.
-    """
-    # Try <dir>/<variable>
-    variable_dir = os.path.join(climate_data_dir, variable)
-    # Search for .zarr directories
-    pattern = os.path.join(variable_dir, f"{variable}_*.zarr")
-    files = glob.glob(pattern)
+# Import helpers from load_data
+from load_data import _subset_region, apply_label_smoothing, load_config
+from feature_engineering import engineer_features
+
+CACHE_DIR = pathlib.Path("cache/climate_data")
+CACHE_LIMIT_GB = 20
+
+def get_config_hash(config: Dict, years: List[int]) -> str:
+    """Generates a stable hash for the data configuration + specific years."""
+    # Create a simplified config dictionary containing only data-relevant parts
+    relevant_config = {
+        "features": sorted(config.get("features", [])),
+        "data": {k: v for k, v in config.get("data", {}).items() if k not in ["train_years", "test_years", "random_seed", "sample_fraction"]},
+        "feature_engineering": config.get("feature_engineering", {}),
+        "years": sorted(years)
+    }
     
-    # Fallback usually not needed if structure is known, but keeping from example
-    if not files:
-        # Try one level deeper just in case
-        pattern = os.path.join(climate_data_dir, "**", f"{variable}_*.zarr")
-        files = glob.glob(pattern, recursive=True)
-        if files:
-            variable_dir = str(pathlib.Path(files[0]).parent)
+    # JSON dump with sort_keys for stability
+    config_str = json.dumps(relevant_config, sort_keys=True)
+    return hashlib.md5(config_str.encode("utf-8")).hexdigest()
 
-    if not files:
-        raise FileNotFoundError(
-            f"No Zarr stores named '{variable}_*.zarr' found in {climate_data_dir}"
-        )
-    return sorted(files), variable_dir
+def manage_cache_size(limit_gb: float = CACHE_LIMIT_GB):
+    """Enforces the cache directory size limit by removing oldest files."""
+    if not CACHE_DIR.exists():
+        return
 
-def load_zarr_variable(
-    climate_data_dir: str, 
-    variable: str, 
-    time_range: Tuple[pd.Timestamp, pd.Timestamp] = None,
-    lat_range: Tuple[float, float] = None, 
-    lon_range: Tuple[float, float] = None
-) -> xr.Dataset:
-    """Load a single variable from Zarr, lazily."""
-    files, _ = find_climate_files(climate_data_dir, variable)
+    total_size = 0
+    files = []
     
-    # Assuming one Zarr store or multiple that need combining
-    # xr.open_mfdataset works with zarr if using engine='zarr', but it's tricky with list of paths.
-    # Usually you open one zarr store at a time.
-    # If there are multiple, they might be split by time.
+    for p in CACHE_DIR.rglob("*.parquet"):
+        try:
+            stat = p.stat()
+            total_size += stat.st_size
+            files.append((stat.st_mtime, p))
+        except FileNotFoundError:
+            pass
+            
+    limit_bytes = limit_gb * 1024**3
     
-    datasets = []
-    # Use open_mfdataset to match example logic, allowing auto-detect
-    # The example uses open_mfdataset on the list of files.
-    # We can try that directly.
-    try:
-        # Note: open_mfdataset with zarr stores in a list is not standard xarray behavior 
-        # (usually it's for netcdf), but the user example does it.
-        # It relies on the backend being able to handle it.
-        # If engine is not specified, xarray tries to guess.
+    if total_size > limit_bytes:
+        print(f"[Cache] Size ({total_size / 1024**3:.2f} GB) exceeds limit ({limit_gb} GB). Cleaning up...")
+        # Sort by mtime (oldest first)
+        files.sort(key=lambda x: x[0])
         
-        # If there is only one file, open_dataset might be better, but let's try open_mfdataset if multiple.
-        if len(files) == 1:
-             ds = xr.open_dataset(files[0], chunks="auto", decode_timedelta=False)
-        else:
-             ds = xr.open_mfdataset(
-                files, 
-                combine="by_coords", 
-                decode_timedelta=False,
-                chunks="auto",
-                parallel=True
-             )
-        datasets.append(ds)
-    except Exception as e:
-        print(f"Warning: Failed to open files for {variable}: {e}")
-        # Fallback to trying individual files with open_dataset
+        deleted_size = 0
+        for _, p in files:
+            try:
+                size = p.stat().st_size
+                p.unlink()
+                deleted_size += size
+                total_size -= size
+                print(f"  Deleted {p.name} ({size / 1024**2:.1f} MB)")
+                
+                if total_size <= limit_bytes:
+                    break
+            except Exception as e:
+                print(f"  Failed to delete {p}: {e}")
+        print(f"[Cache] Cleanup complete. New size: {total_size / 1024**3:.2f} GB")
+
+def load_zarr_dataset(
+    climate_data_dir: str, 
+    variables: List[str], 
+    lat_range: Tuple[float, float],
+    lon_range: Tuple[float, float]
+) -> xr.Dataset:
+    """
+    Loads ALL available Zarr data lazily. 
+    Uses a safe sequential open + concat approach to avoid malloc/threading crashes.
+    """
+    datasets = []
+    
+    for var in variables:
+        # 1. Find files
+        search_path = os.path.join(climate_data_dir, var, f"{var}_*.zarr")
+        files = sorted(glob.glob(search_path))
+        if not files:
+            files = sorted(glob.glob(os.path.join(climate_data_dir, "**", f"{var}_*.zarr"), recursive=True))
+            if not files:
+                raise FileNotFoundError(f"No Zarr files found for variable: {var}")
+
+        # 2. Open Lazy (Sequential to prevent Segfault)
+        # We avoid open_mfdataset because it spawns threads that can crash underlying C-libs with Zarr
+        var_chunks = []
         for f in files:
             try:
-                # auto-detect engine
-                ds = xr.open_dataset(f, chunks="auto", decode_timedelta=False)
-                datasets.append(ds)
-            except Exception as e2:
-                print(f"  Failed to open {f}: {e2}")
+                # chunks="auto" defers loading (Lazy)
+                ds = xr.open_dataset(f, engine="zarr", chunks="auto", decode_timedelta=False)
+                var_chunks.append(ds)
+            except Exception as e:
+                print(f"Warning: Could not open {f}: {e}")
 
-    if not datasets:
-        raise IOError(f"Could not open any datasets for {variable}")
+        if not var_chunks:
+            raise IOError(f"Failed to open any files for {var}")
 
-    if len(datasets) > 1:
-        # Concatenate if multiple files
-        # Assuming they are split by time or something compatible
-        ds = xr.concat(datasets, dim="valid_time") # Adjust dim if needed
-        ds = ds.sortby("valid_time")
-    else:
-        ds = datasets[0]
+        # 3. Concatenate
+        # Assuming files are split by time (standard for climate data)
+        try:
+            concat_dim = "valid_time" if "valid_time" in var_chunks[0].coords else "time"
+            ds_var = xr.concat(var_chunks, dim=concat_dim)
+            ds_var = ds_var.sortby(concat_dim)
+        except Exception as e:
+            # Fallback for unexpected structures
+            print(f"Concatenation failed for {var}, trying merge. Error: {e}")
+            ds_var = xr.merge(var_chunks)
 
-    # Standardize coordinate names
-    if "valid_time" in ds.coords:
-        ds = ds.rename({"valid_time": "time"})
+        # 4. Standardize Time Name
+        if "valid_time" in ds_var.coords:
+            ds_var = ds_var.rename({"valid_time": "time"})
+            
+        # --- FIX: Ensure Unique Time Index ---
+        # Dropping duplicates is essential if files overlap
+        _, index = np.unique(ds_var['time'], return_index=True)
+        ds_var = ds_var.isel(time=index)
+        # -------------------------------------
+        
+        # 5. Spatial Slice (Lazy - reduces graph size)
+        if lat_range:
+            lat_name = 'latitude' if 'latitude' in ds_var.coords else 'lat'
+            if ds_var[lat_name][0] > ds_var[lat_name][-1]:
+                ds_var = ds_var.sel({lat_name: slice(lat_range[1], lat_range[0])})
+            else:
+                ds_var = ds_var.sel({lat_name: slice(lat_range[0], lat_range[1])})
+        
+        if lon_range:
+            lon_name = 'longitude' if 'longitude' in ds_var.coords else 'lon'
+            ds_var = ds_var.sel({lon_name: slice(lon_range[0], lon_range[1])})
+            
+        rename_dict = {}
+        if 'lat' in ds_var.coords and 'latitude' not in ds_var.coords: rename_dict['lat'] = 'latitude'
+        if 'lon' in ds_var.coords and 'longitude' not in ds_var.coords: rename_dict['lon'] = 'longitude'
+        if rename_dict:
+            ds_var = ds_var.rename(rename_dict)
+            
+        datasets.append(ds_var)
+
+    # Merge all variables into one Dataset
+    return xr.merge(datasets, join='inner')
+
+def load_targets_lazy(
+    years: Iterable[int],
+    target_dir: str,
+    file_template: str,
+    lat_range: Tuple[float, float],
+    lon_range: Tuple[float, float]
+) -> xr.Dataset:
+    files = []
+    for yr in sorted(list(years)):
+        fpath = pathlib.Path(target_dir) / file_template.format(year=yr)
+        if fpath.exists():
+            files.append(str(fpath))
     
-    if "time" not in ds.coords:
-        raise ValueError(f"Dataset for {variable} missing time coordinate (checked 'time' and 'valid_time')")
+    if not files:
+        raise FileNotFoundError("No target files found.")
 
-    # Spatial slicing
-    if lat_range and ('latitude' in ds.coords or 'lat' in ds.coords):
-        lat_name = 'latitude' if 'latitude' in ds.coords else 'lat'
-        # Handle decreasing latitude if necessary
-        lat_vals = ds[lat_name]
-        start, end = lat_range
-        if lat_vals[0] > lat_vals[-1]:
-             ds = ds.sel({lat_name: slice(end, start)})
-        else:
-             ds = ds.sel({lat_name: slice(start, end)})
-             
-    if lon_range and ('longitude' in ds.coords or 'lon' in ds.coords):
-        lon_name = 'longitude' if 'longitude' in ds.coords else 'lon'
-        ds = ds.sel({lon_name: slice(lon_range[0], lon_range[1])})
+    # Disable parallel=True here too just to be safe
+    ds = xr.open_mfdataset(files, combine="by_coords", chunks="auto", parallel=False)
+    
+    if "date" in ds.coords: ds = ds.rename({"date": "time"})
+    
+    # --- FIX: Ensure Unique Target Time Index ---
+    _, index = np.unique(ds['time'], return_index=True)
+    ds = ds.isel(time=index)
+    # --------------------------------------------
 
-    # Time slicing
-    if time_range:
-        dataset_time = ds['time'] # already renamed
-        # Convert pandas timestamps to numpy datetime64 compatible with xarray
-        # Assuming dataset uses datetime64[ns]
-        ds = ds.sel(time=slice(time_range[0], time_range[1]))
-
+    ds = _subset_region(ds, lat_range, lon_range)
+    
+    rename_dict = {}
+    if 'lat' in ds.coords and 'latitude' not in ds.coords: rename_dict['lat'] = 'latitude'
+    if 'lon' in ds.coords and 'longitude' not in ds.coords: rename_dict['lon'] = 'longitude'
+    if rename_dict:
+        ds = ds.rename(rename_dict)
+        
     return ds
 
 def load_years(
@@ -137,226 +196,179 @@ def load_years(
     apply_feature_engineering: bool = True,
     return_hard_labels: bool = False,
     apply_label_smoothing_flag: bool = True,
-    **kwargs # consume extra args
-) -> Tuple[pd.DataFrame, pd.Series] | Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
-    """
-    Load data for specified years from Zarr sources + Targets.
-    """
+    use_cache: bool = True,
+    **kwargs
+) -> Union[Tuple[pd.DataFrame, pd.Series], Tuple[pd.DataFrame, pd.Series, pd.DataFrame], Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]]:
+    
+    start_time_glob = pd.Timestamp.now()
     years = sorted(list(years))
-    if verbose:
-        print(f"Loading climate data for years: {years} from Zarr files...")
-        
     data_cfg = config["data"]
-    features_dir = data_cfg["features_dir"]
-    variables = config["features"]
     
-    # Determine full time range needed
-    # We load slightly more to allow for lags
-    start_year = min(years)
-    end_year = max(years)
+    sample_fraction = kwargs.get("sample_fraction", data_cfg.get("sample_fraction", 1.0))
+    random_seed = kwargs.get("random_seed", data_cfg.get("random_seed", 42))
     
-    # Add buffer for lags (Use 2 years for building features as requested)
-    # The feature engineering needs raw data before the start date for lags/windows
-    buffer_days = 730 
-    start_date = pd.Timestamp(f"{start_year}-01-01") - pd.Timedelta(days=buffer_days)
-    end_date = pd.Timestamp(f"{end_year}-12-31")
-    
+    # --- Caching Setup ---
+    cache_subdir = None
+    if use_cache:
+        # Hash logic must be very robust. We hash the config relevant to data processing + list of years.
+        # Actually, caching per year is better, so we can reuse years across experiments.
+        # So the hash should depend on config but NOT the list of years requested (we'll look up year by year).
+        config_hash = get_config_hash(config, []) # Empty list for base config hash
+        cache_subdir = CACHE_DIR / config_hash
+        cache_subdir.mkdir(parents=True, exist_ok=True)
+        if verbose: print(f"Cache Directory: {cache_subdir}")
+    # ---------------------
+
+    # 1. Calc Buffer
+    fe_config = config.get("feature_engineering", {})
+    fe_enabled = fe_config.get("enabled", True) and apply_feature_engineering
+    buffer_days = 0
+    if fe_enabled:
+        lookbacks = [0]
+        if "lag" in fe_config: lookbacks.extend(fe_config["lag"].get("lags", []))
+        if "ewm" in fe_config: lookbacks.append(max(fe_config["ewm"].get("spans", [0])) * 3)
+        if "temporal_diff" in fe_config: lookbacks.extend(fe_config["temporal_diff"].get("periods", []))
+        buffer_days = max(lookbacks) + 5
+
     lat_range = tuple(data_cfg["latitude_range"])
     lon_range = tuple(data_cfg["longitude_range"])
+    variables = config["features"]
 
-    # 1. Load all variables
-    feature_datasets = []
+    # Check what needs to be computed vs loaded
+    years_to_compute = []
+    processed_dfs = []
     
-    for var in variables:
-        if verbose:
-            print(f"  Loading variable: {var}...", end=" ", flush=True)
-        try:
-            ds = load_zarr_variable(
-                features_dir, 
-                var, 
-                time_range=(start_date, end_date),
-                lat_range=lat_range,
-                lon_range=lon_range
-            )
-            # Ensure unified lat/lon names for merging
-            ds = ds.rename({
-                k: v for k, v in {'lat': 'latitude', 'lon': 'longitude'}.items() 
-                if k in ds.coords and v not in ds.coords
-            })
-            feature_datasets.append(ds)
-            if verbose:
-                print("done.")
-        except Exception as e:
-            if verbose: print(f"failed! ({e})")
-            raise
-
-    # 2. Merge variables
-    if verbose:
-        print("  Merging variables...", end=" ", flush=True)
-    
-    # Use inner join to ensure we have data for all variables
-    ds_features = xr.merge(feature_datasets, join="inner")
-    
-    # 3. Feature Engineering
-    if apply_feature_engineering:
-        if verbose:
-            print("  Applying feature engineering...", end=" ", flush=True)
-        
-        # Load into memory for FE (might be heavy, but FE in dask can be slow too)
-        # Assuming memory is sufficient as per original script behavior
-        ds_features = ds_features.load()
-        
-        ds_features = engineer_features(
-            ds_features, 
-            config.get("feature_engineering", {}),
-            time_dim="time",
-            lat_dim="latitude",
-            lon_dim="longitude"
-        )
-        if verbose:
-            print("done.")
-
-    # 4. Trim time range to requested years (remove buffer)
-    # Be precise: start of start_year to end of end_year
-    exact_start = pd.Timestamp(f"{start_year}-01-01")
-    exact_end = pd.Timestamp(f"{end_year}-12-31")
-    ds_features = ds_features.sel(time=slice(exact_start, exact_end))
-
-    # --- NEW: Interpolate features to target resolution ---
-    interpolate = kwargs.get("interpolate", config.get("data", {}).get("interpolate", True))
-    if interpolate:
-        if verbose:
-            print("  Interpolating features to target grid...", end=" ", flush=True)
-
-        # Find a sample target file to get the grid
-        sample_target_path = None
-        target_path_template = pathlib.Path(data_cfg["target_dir"]) / data_cfg["target_file_template"]
+    # 2. Try Loading from Cache
+    if use_cache:
         for yr in years:
-            p = pathlib.Path(str(target_path_template).format(year=yr))
-            if p.exists():
-                sample_target_path = p
-                break
-                
-        if sample_target_path:
-            with xr.open_dataset(sample_target_path) as ds_t_sample:
-                # Standardize coords in sample
-                if "date" in ds_t_sample.coords: ds_t_sample = ds_t_sample.rename({"date": "time"})
-                # Rename lat/lon if needed to match features (latitude/longitude)
-                rename_dict = {}
-                if "lat" in ds_t_sample.coords and "latitude" not in ds_t_sample.coords: rename_dict["lat"] = "latitude"
-                if "lon" in ds_t_sample.coords and "longitude" not in ds_t_sample.coords: rename_dict["lon"] = "longitude"
-                if rename_dict:
-                    ds_t_sample = ds_t_sample.rename(rename_dict)
+            cache_file = cache_subdir / f"{yr}.parquet"
+            if cache_file.exists():
+                if verbose: print(f"  [Cache] Loading {yr}...", end=" ", flush=True)
+                try:
+                     # Touch the file to update mtime for LRU eviction
+                    cache_file.touch()
+                    df_year = pd.read_parquet(cache_file)
                     
-                # Subset to config range (same as we do for targets later)
-                ds_t_sample = _subset_region(ds_t_sample, lat_range, lon_range)
+                    if sample_fraction < 1.0 and not df_year.empty:
+                        df_year = df_year.sample(frac=sample_fraction, random_state=random_seed)
+                    
+                    processed_dfs.append(df_year)
+                    if verbose: print(f"done. ({len(df_year):,} rows)")
+                except Exception as e:
+                    print(f"Error loading cache for {yr}: {e}. Will recompute.")
+                    years_to_compute.append(yr)
+            else:
+                years_to_compute.append(yr)
+    else:
+        years_to_compute = years
+
+    # 3. Open Global Datasets (Lazy) - ONLY if we have years to compute
+    if years_to_compute:
+        if verbose:
+            print(f"Loading Raw Data for {years_to_compute} (Buffer: {buffer_days}d)")
+
+        ds_features_global = load_zarr_dataset(
+            data_cfg["features_dir"], variables, lat_range, lon_range
+        )
+        ds_targets_global = load_targets_lazy(
+            years_to_compute, data_cfg["target_dir"], data_cfg["target_file_template"], lat_range, lon_range
+        )
+
+        manage_cache_size() # Pre-emptive clean
+
+        # 4. Stream & Process Batch-by-Batch
+        for yr in years_to_compute:
+            if verbose: print(f"  Processing {yr}...", end=" ", flush=True)
+            
+            t_start = pd.Timestamp(f"{yr}-01-01")
+            t_end = pd.Timestamp(f"{yr}-12-31")
+            
+            feat_start = t_start - pd.Timedelta(days=buffer_days)
+            feat_end = t_end 
+            
+            # A. Slice (Lazy)
+            try:
+                ds_chunk_feat = ds_features_global.sel(time=slice(feat_start, feat_end))
+                ds_chunk_target = ds_targets_global.sel(time=slice(t_start, t_end))
+            except KeyError:
+                print(f"Warning: Data missing for {yr}, skipping.")
+                continue
+
+            if ds_chunk_target.time.size == 0:
+                print(f"No target data for {yr}, skipping.")
+                continue
+
+            # B. Feature Engineering (Lazy)
+            if fe_enabled:
+                ds_chunk_feat = engineer_features(ds_chunk_feat, fe_config)
                 
-                # Extract grid
-                target_lats = ds_t_sample["latitude"]
-                target_lons = ds_t_sample["longitude"]
+            # C. Align
+            # Select common times
+            ds_chunk_feat = ds_chunk_feat.sel(time=ds_chunk_target.time)
+            
+            # Reindex features to target grid (Spatial align)
+            ds_chunk_feat = ds_chunk_feat.reindex(
+                latitude=ds_chunk_target.latitude, 
+                longitude=ds_chunk_target.longitude, 
+                method='nearest', tolerance=0.01
+            )
+            
+            # Merge
+            ds_merged = xr.merge([ds_chunk_feat, ds_chunk_target], join='inner')
+
+            # --- OPTIMIZATION: Cast to float32 to save space/memory ---
+            for var in ds_merged.data_vars:
+                if ds_merged[var].dtype == 'float64':
+                    ds_merged[var] = ds_merged[var].astype('float32')
+            # ----------------------------------------------------------
+            
+            # D. MATERIALIZE
+            try:
+                df_year = ds_merged.to_dataframe().reset_index().dropna()
+            except MemoryError:
+                 print("Memory Warning! Chunking compute...")
+                 df_year = ds_merged.compute().to_dataframe().reset_index().dropna()
+            
+            # E. Save to Cache (BEFORE subsampling)
+            if use_cache and not df_year.empty:
+                 cache_file = cache_subdir / f"{yr}.parquet"
+                 try:
+                     # Check size again before write
+                     manage_cache_size() 
+                     df_year.to_parquet(cache_file, index=False, compression='snappy')
+                 except Exception as e:
+                     print(f"Warning: Could not save to cache: {e}")
+
+            # F. Subsample In-Memory (Fast)
+            if sample_fraction < 1.0 and not df_year.empty:
+                df_year = df_year.sample(frac=sample_fraction, random_state=random_seed)
                 
-                # Interpolate
-                ds_features = ds_features.interp(
-                    latitude=target_lats, 
-                    longitude=target_lons, 
-                    method="linear"
-                )
-            if verbose:
-                print(f"done. (Grid: {len(target_lats)}x{len(target_lons)})")
-        else:
-            print("Warning: Could not find any target files to determine grid for interpolation!")
-    elif verbose:
-        print("  Skipping interpolation (interpolate=False)")
-    # ------------------------------------------------------
+            processed_dfs.append(df_year)
+            
+            del ds_merged, ds_chunk_feat, ds_chunk_target, df_year
+            gc.collect()
+            
+            if verbose: print(f"done. ({len(processed_dfs[-1]):,} rows)")
 
-    # 5. Load Targets for each year and merge
-    if verbose:
-        print("  Loading targets...", end=" ", flush=True)
+    # 5. Final Concat
+    if not processed_dfs:
+        raise ValueError("No data loaded for any year!")
         
-    target_dfs = []
-    for yr in years:
-        target_path = pathlib.Path(data_cfg["target_dir"]) / data_cfg["target_file_template"].format(year=yr)
-        if not target_path.exists():
-             raise FileNotFoundError(f"Target file missing for year {yr}: {target_path}")
-        
-        with xr.open_dataset(target_path) as ds_t:
-             # Standardize coords
-             if "date" in ds_t.coords: ds_t = ds_t.rename({"date": "time"})
-             ds_t = _subset_region(ds_t, lat_range, lon_range)
-             ds_t = ds_t.load()
-             
-             # Convert to DF
-             df_t, y_t, meta_t = _to_dataframe_fast(ds_t, data_cfg["target_var"])
-             
-             # Re-attach target to df for merging
-             df_t[data_cfg["target_var"]] = y_t
-             # Add metadata for safe merge
-             df_t["time"] = meta_t["time"]
-             df_t["latitude"] = meta_t["latitude"]
-             df_t["longitude"] = meta_t["longitude"]
-             
-             target_dfs.append(df_t)
-
-    full_target_df = pd.concat(target_dfs, axis=0, ignore_index=True)
+    if verbose: print("  Concatenating years...", end=" ", flush=True)
+    df_final = pd.concat(processed_dfs, axis=0, ignore_index=True)
+    if verbose: print(f"done. Total shape: {df_final.shape}")
     
-    # 6. Merge Features with Target
-    # Convert features to DF
-    if verbose:
-        print("  converting features to DataFrame...", end=" ", flush=True)
-        
-    # We need a dummy target var for _to_dataframe_fast or use a different method.
-    # _to_dataframe_fast assumes a target var is present to separate X and y.
-    # But here ds_features only has features.
-    
-    # Let's check _to_dataframe_fast again in load_data.py
-    # It executes: y = df.pop(target_var).astype("int64")
-    # So we must provide a variable.
-    # Let's add a dummy target to ds_features matching the shape of existing vars
-    first_var_name = list(ds_features.data_vars)[0]
-    ds_features["__dummy__"] = (ds_features[first_var_name] * 0).astype(int)
-    df_features, _, meta_features = _to_dataframe_fast(ds_features, "__dummy__")
-    
-    # Add meta to df_features for merging
-    df_features["time"] = meta_features["time"]
-    df_features["latitude"] = meta_features["latitude"]
-    df_features["longitude"] = meta_features["longitude"]
-    
-    if verbose:
-        print("  Merging features with target...", end=" ", flush=True)
-
-    # Merge on coordinates
-    # Ensure compatible types
-    # xarray loading might result in slightly different datetime precision vs netcdf target
-    # Often it's safer to coerce to proper datetime in pandas
-    
-    df_features["time"] = pd.to_datetime(df_features["time"])
-    full_target_df["time"] = pd.to_datetime(full_target_df["time"])
-    
-    # Round coordinates to avoid float precision issues
-    for col in ["latitude", "longitude"]:
-        df_features[col] = df_features[col].round(2)
-        full_target_df[col] = full_target_df[col].round(2)
-        
-    # Merge
-    merged_df = pd.merge(
-        df_features, 
-        full_target_df, 
-        on=["time", "latitude", "longitude"], 
-        how="inner"
-    )
-    
-    if verbose:
-        print(f"done. (Final shape: {merged_df.shape})")
-
-    # 7. Finalize
+    # 6. Extract X, y
     target_var = data_cfg["target_var"]
-    y = merged_df.pop(target_var)
+    y = df_final[target_var].copy()
+    meta = df_final[["time", "latitude", "longitude"]].copy()
     
-    # Extract metadata
-    meta = merged_df[["time", "latitude", "longitude"]].copy()
-    merged_df = merged_df.drop(columns=["time", "latitude", "longitude"])
+    # Only drop known metadata/targets, keep all other columns (including engineered features)
+    drop_cols = [target_var, "time", "latitude", "longitude", "valid_time"]
     
-    # Label Smoothing
+    X = df_final.drop(columns=[c for c in drop_cols if c in df_final.columns])
+
+    # 7. Label Smoothing
     y_hard = y.copy()
     ls_enabled = config.get("label_smoothing", {}).get("enabled", False)
     if ls_enabled and apply_label_smoothing_flag:
@@ -373,12 +385,11 @@ def load_years(
              verbose=verbose
          )
 
-    # Return
     if return_hard_labels and return_metadata:
-        return merged_df, y, meta, y_hard
+        return X, y, meta, y_hard
     elif return_hard_labels:
-        return merged_df, y, y_hard
+        return X, y, y_hard
     elif return_metadata:
-        return merged_df, y, meta
+        return X, y, meta
     else:
-        return merged_df, y
+        return X, y

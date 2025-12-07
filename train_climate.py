@@ -11,6 +11,7 @@ from sklearn.model_selection import train_test_split
 
 # Use the new data loader
 from load_climate_data import load_config, load_years
+from prepare_land import prepare_land_data, landsea_distance
 
 def split_data(
     X: pd.DataFrame, y: pd.Series, validation_size: float, random_seed: int,
@@ -71,15 +72,62 @@ def train_model(config: Dict) -> None:
     print(f"Output model path: {output_cfg['model_path']}")
     print("\nLoading training data...")
     
-    # Load data using the new module
     X, y, meta, y_hard = load_years(
         data_cfg["train_years"], 
         config=config, 
         return_hard_labels=True,
         return_metadata=True,
-        apply_label_smoothing_flag=True
+        apply_label_smoothing_flag=True,
+        align_to_targets=True
     )
     print(f"Data loaded: {len(X):,} samples, {len(X.columns)} features")
+
+
+
+    # --- Integrate Static Land Features ---
+    print("\nIntegrating static land features...")
+    
+    # 1. Distance to Coast
+    # Note: landsea_distance uses default paths we updated in prepare_land.py
+    print("  Calculating distance to coast...")
+    meta_with_dist, dist_cols = landsea_distance(meta, lat_col="latitude", lon_col="longitude")
+    
+    # Add to X (ensuring alignment)
+    for col in dist_cols:
+        X[col] = meta_with_dist[col].values
+    print(f"  Added {len(dist_cols)} distance features: {dist_cols}")
+    
+    # 2. Other Land Data (Forest, Elevation)
+    land_files = [
+        "climate_data/land_data/forest_data.nc",
+        "climate_data/land_data/GMTED2010_15n015_00625deg.nc"
+    ]
+    print(f"  Processing land data files: {land_files}")
+    
+    # We pass 'meta' as the target dataframe. 
+    # prepare_land_data returns the dataframe with new columns + list of new column names.
+    meta_with_land, land_cols = prepare_land_data(
+        land_files, 
+        meta, 
+        lat_col="latitude", 
+        lon_col="longitude"
+    )
+    
+    # Add to X
+    # Note: process uses Polars internally and returns Pandas with potentially reset index, 
+    # but row order is preserved. X has RangeIndex from load_years merge.
+    if len(meta_with_land) != len(X):
+        print(f"Warning: Land feature integration resulted in {len(meta_with_land)} rows, expected {len(X)}")
+    
+    # Assign new columns to X
+    # Using values to ignore index mismatches if any (though they should align by position)
+    for col in land_cols:
+        if col in meta_with_land.columns:
+            X[col] = meta_with_land[col].values
+            
+    print(f"  Added {len(land_cols)} features from land data files.")
+    print(f"  Total features after integration: {len(X.columns)}")
+    # --------------------------------------
     
     if use_label_smoothing:
         print(f"[Label Smoothing] Label stats: min={y.min():.3f}, max={y.max():.3f}, mean={y.mean():.3f}")
@@ -200,7 +248,7 @@ def main() -> None:
     print("=" * 60)
 
     parser = argparse.ArgumentParser(description="Train CatBoost event model with new data")
-    parser.add_argument("--config", default="configs/config_climate_coldwaves.yaml", help="Path to config YAML")
+    parser.add_argument("--config", default="configs/config_climate_heatwave.yaml", help="Path to config YAML")
     args = parser.parse_args()
 
     print(f"Loading config from: {args.config}")

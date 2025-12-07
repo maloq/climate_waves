@@ -347,7 +347,8 @@ class OptunaObjective:
             apply_feature_engineering=True,
             return_hard_labels=False, # Raw y is hard because smoothing is disabled
             return_metadata=True,
-            apply_label_smoothing_flag=False
+            apply_label_smoothing_flag=False,
+            align_to_targets=True
         )
         
         # Load Validation Data
@@ -358,7 +359,8 @@ class OptunaObjective:
             apply_feature_engineering=True,
             return_hard_labels=False,
             return_metadata=True,
-            apply_label_smoothing_flag=False
+            apply_label_smoothing_flag=False,
+            align_to_targets=True
         )
         
         if self.verbose:

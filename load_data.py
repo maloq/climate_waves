@@ -601,6 +601,13 @@ def load_single_year(
             
             if "date" in features.coords: features = features.rename({"date": "time"})
             
+            # Normalize timestamps to midnight to ensure alignment between features and target
+            # (e.g. features at 00:00 vs target at 09:00)
+            if "time" in features.coords:
+                features["time"] = features.time.dt.floor("D")
+            if "time" in target.coords:
+                target["time"] = target.time.dt.floor("D")
+            
             # Handle 'valid_time' which might be used instead of 'date'/'time' for some variables (e.g. 2024 data)
             # If both exist, we need to align them.
             if "valid_time" in features.coords:

@@ -11,82 +11,7 @@ from catboost import CatBoostClassifier
 from sklearn.metrics import classification_report
 
 from load_data import load_config, load_years
-
-
-def plot_monthly_maps(
-    meta: pd.DataFrame,
-    targets: pd.Series,
-    probs: np.ndarray,
-    preds: np.ndarray,
-    year: int,
-    output_dir: Path,
-) -> None:
-    """aggregates predictions and targets by month and plots spatial means."""
-    output_dir = output_dir / "maps"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create a dataframe with all necessary data
-    df = meta.copy()
-    df["target"] = targets.values
-    df["prob"] = probs
-    df["pred"] = preds
-    df["month"] = pd.to_datetime(df["time"]).dt.month
-
-    # Get unique months present in the data
-    months = sorted(df["month"].unique())
-
-    for month in months:
-        monthly_df = df[df["month"] == month]
-        n_days = monthly_df["time"].nunique()
-        n_records = len(monthly_df)
-        target_mean = monthly_df["target"].mean()
-        print(f"[DEBUG] Month {month}: {n_days} unique days, {n_records} records, target mean: {target_mean:.4f}")
-        
-        # Group by lat/lon to get mean values for the month
-        grid_df = monthly_df.groupby(["latitude", "longitude"])[["target", "prob", "pred"]].mean().reset_index()
-        
-        # Pivot to create 2D arrays for plotting
-        target_grid = grid_df.pivot(index="latitude", columns="longitude", values="target")
-        prob_grid = grid_df.pivot(index="latitude", columns="longitude", values="prob")
-        pred_grid = grid_df.pivot(index="latitude", columns="longitude", values="pred")
-        
-        # Sort index/columns
-        target_grid = target_grid.sort_index(ascending=True).sort_index(axis=1)
-        prob_grid = prob_grid.sort_index(ascending=True).sort_index(axis=1)
-        pred_grid = pred_grid.sort_index(ascending=True).sort_index(axis=1)
-
-        lons = prob_grid.columns
-        lats = prob_grid.index
-        
-        # Plotting - 3 panels now
-        fig, axes = plt.subplots(1, 3, figsize=(24, 6))
-        
-        # 1. Ground Truth (Target)
-        im0 = axes[0].pcolormesh(lons, lats, target_grid.values, shading='auto', cmap='viridis', vmin=0, vmax=1)
-        axes[0].set_title(f"Ground Truth (Mean Target) - {year}-{month:02d}")
-        axes[0].set_xlabel("Longitude")
-        axes[0].set_ylabel("Latitude")
-        plt.colorbar(im0, ax=axes[0], label="Proportion")
-        
-        # 2. Predicted Probability
-        im1 = axes[1].pcolormesh(lons, lats, prob_grid.values, shading='auto', cmap='viridis', vmin=0, vmax=1)
-        axes[1].set_title(f"Predicted Probability - {year}-{month:02d}")
-        axes[1].set_xlabel("Longitude")
-        axes[1].set_ylabel("Latitude")
-        plt.colorbar(im1, ax=axes[1], label="Probability")
-
-        # 3. Binary Prediction
-        im2 = axes[2].pcolormesh(lons, lats, pred_grid.values, shading='auto', cmap='viridis', vmin=0, vmax=1)
-        axes[2].set_title(f"Binary Prediction - {year}-{month:02d}")
-        axes[2].set_xlabel("Longitude")
-        axes[2].set_ylabel("Latitude")
-        plt.colorbar(im2, ax=axes[2], label="Proportion Predicted 1")
-
-        plt.tight_layout()
-        save_path = output_dir / f"{year}_{month:02d}.png"
-        plt.savefig(save_path, dpi=150)
-        plt.close(fig)
-        print(f"Saved map to {save_path}")
+from visualization import plot_monthly_maps
 
 
 def evaluate_year(
@@ -125,7 +50,7 @@ def evaluate_year(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate trained model on holdout years")
-    parser.add_argument("--config", default="configs/config_coldwave.yaml", help="Path to config YAML")
+    parser.add_argument("--config", default="configs/config_wind.yaml", help="Path to config YAML")
     args = parser.parse_args()
 
     config = load_config(args.config)

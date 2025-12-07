@@ -1,0 +1,36 @@
+data:
+  features_dir: /home/infres/vmorozov/Misc/data/climate_data_files/ECMWF
+  target_dir: climate_data/target/target_heat_waves_1984_span_30_threshold_7
+  target_file_template: "extemp_7_{year}.nc"
+  target_var: extemp
+  latitude_range: [40.0, 60.0]
+  longitude_range: [30.0, 120.0]
+  train_years: [2022] # Use just one year to be faster
+  test_years: [2023]
+  sample_fraction: 0.1 # The key parameter to test
+  random_seed: 42
+  interpolate: false
+
+features:
+- t2m
+
+feature_engineering:
+  enabled: false
+
+model:
+  iterations: 1 # Quick run
+  learning_rate: 0.1
+  depth: 6
+  loss_function: Logloss
+  eval_metric: F1
+  task_type: CPU # Use CPU for small test
+  decision_threshold: 0.5
+  verbose: 10
+
+training:
+  validation_size: 0.2
+  shuffle: true
+
+output:
+  model_path: artifacts/test_subsample/model.cbm
+  predictions_dir: artifacts/test_subsample/predictions
