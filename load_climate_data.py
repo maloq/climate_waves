@@ -155,9 +155,9 @@ def load_years(
     start_year = min(years)
     end_year = max(years)
     
-    # Add buffer for lags (e.g. 30 days)
+    # Add buffer for lags (Use 2 years for building features as requested)
     # The feature engineering needs raw data before the start date for lags/windows
-    buffer_days = 60 
+    buffer_days = 730 
     start_date = pd.Timestamp(f"{start_year}-01-01") - pd.Timedelta(days=buffer_days)
     end_date = pd.Timestamp(f"{end_year}-12-31")
     
@@ -223,46 +223,50 @@ def load_years(
     ds_features = ds_features.sel(time=slice(exact_start, exact_end))
 
     # --- NEW: Interpolate features to target resolution ---
-    if verbose:
-        print("  Interpolating features to target grid...", end=" ", flush=True)
-
-    # Find a sample target file to get the grid
-    sample_target_path = None
-    target_path_template = pathlib.Path(data_cfg["target_dir"]) / data_cfg["target_file_template"]
-    for yr in years:
-        p = pathlib.Path(str(target_path_template).format(year=yr))
-        if p.exists():
-            sample_target_path = p
-            break
-            
-    if sample_target_path:
-        with xr.open_dataset(sample_target_path) as ds_t_sample:
-            # Standardize coords in sample
-            if "date" in ds_t_sample.coords: ds_t_sample = ds_t_sample.rename({"date": "time"})
-            # Rename lat/lon if needed to match features (latitude/longitude)
-            rename_dict = {}
-            if "lat" in ds_t_sample.coords and "latitude" not in ds_t_sample.coords: rename_dict["lat"] = "latitude"
-            if "lon" in ds_t_sample.coords and "longitude" not in ds_t_sample.coords: rename_dict["lon"] = "longitude"
-            if rename_dict:
-                ds_t_sample = ds_t_sample.rename(rename_dict)
-                
-            # Subset to config range (same as we do for targets later)
-            ds_t_sample = _subset_region(ds_t_sample, lat_range, lon_range)
-            
-            # Extract grid
-            target_lats = ds_t_sample["latitude"]
-            target_lons = ds_t_sample["longitude"]
-            
-            # Interpolate
-            ds_features = ds_features.interp(
-                latitude=target_lats, 
-                longitude=target_lons, 
-                method="linear"
-            )
+    interpolate = kwargs.get("interpolate", config.get("data", {}).get("interpolate", True))
+    if interpolate:
         if verbose:
-            print(f"done. (Grid: {len(target_lats)}x{len(target_lons)})")
-    else:
-        print("Warning: Could not find any target files to determine grid for interpolation!")
+            print("  Interpolating features to target grid...", end=" ", flush=True)
+
+        # Find a sample target file to get the grid
+        sample_target_path = None
+        target_path_template = pathlib.Path(data_cfg["target_dir"]) / data_cfg["target_file_template"]
+        for yr in years:
+            p = pathlib.Path(str(target_path_template).format(year=yr))
+            if p.exists():
+                sample_target_path = p
+                break
+                
+        if sample_target_path:
+            with xr.open_dataset(sample_target_path) as ds_t_sample:
+                # Standardize coords in sample
+                if "date" in ds_t_sample.coords: ds_t_sample = ds_t_sample.rename({"date": "time"})
+                # Rename lat/lon if needed to match features (latitude/longitude)
+                rename_dict = {}
+                if "lat" in ds_t_sample.coords and "latitude" not in ds_t_sample.coords: rename_dict["lat"] = "latitude"
+                if "lon" in ds_t_sample.coords and "longitude" not in ds_t_sample.coords: rename_dict["lon"] = "longitude"
+                if rename_dict:
+                    ds_t_sample = ds_t_sample.rename(rename_dict)
+                    
+                # Subset to config range (same as we do for targets later)
+                ds_t_sample = _subset_region(ds_t_sample, lat_range, lon_range)
+                
+                # Extract grid
+                target_lats = ds_t_sample["latitude"]
+                target_lons = ds_t_sample["longitude"]
+                
+                # Interpolate
+                ds_features = ds_features.interp(
+                    latitude=target_lats, 
+                    longitude=target_lons, 
+                    method="linear"
+                )
+            if verbose:
+                print(f"done. (Grid: {len(target_lats)}x{len(target_lons)})")
+        else:
+            print("Warning: Could not find any target files to determine grid for interpolation!")
+    elif verbose:
+        print("  Skipping interpolation (interpolate=False)")
     # ------------------------------------------------------
 
     # 5. Load Targets for each year and merge

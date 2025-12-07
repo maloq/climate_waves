@@ -72,10 +72,11 @@ def train_model(config: Dict) -> None:
     print("\nLoading training data...")
     
     # Load data using the new module
-    X, y, y_hard = load_years(
+    X, y, meta, y_hard = load_years(
         data_cfg["train_years"], 
         config=config, 
         return_hard_labels=True,
+        return_metadata=True,
         apply_label_smoothing_flag=True
     )
     print(f"Data loaded: {len(X):,} samples, {len(X.columns)} features")
@@ -85,13 +86,23 @@ def train_model(config: Dict) -> None:
     
     print("Splitting data into train/validation sets...")
     
-    X_train, X_val, y_train, y_val, y_train_hard, y_val_hard = split_data(
-        X=X,
-        y=y,
-        validation_size=train_cfg.get("validation_size", 0.2),
-        random_seed=data_cfg.get("random_seed", 42),
-        y_hard=y_hard,
-        use_soft_labels=use_label_smoothing,
+    # Stratified split using metadata
+    # We need to split X, y, y_hard, and meta consistently
+    if use_label_smoothing and y_hard is not None:
+        stratify_labels = y_hard 
+    elif use_label_smoothing:
+        stratify_labels = (y >= 0.5).astype(int)
+    else:
+        stratify_labels = y
+        
+    # Using train_test_split directly here to handle the 4th array (meta) easier than modifying split_data helper
+    # which is getting complicated with all optional args
+    X_train, X_val, y_train, y_val, y_train_hard, y_val_hard, meta_train, meta_val = train_test_split(
+        X, y, y_hard, meta,
+        test_size=train_cfg.get("validation_size", 0.2),
+        random_state=data_cfg.get("random_seed", 42),
+        shuffle=train_cfg.get("shuffle", True),
+        stratify=stratify_labels
     )
 
     class_weights = train_cfg.get("class_weights")
@@ -149,6 +160,23 @@ def train_model(config: Dict) -> None:
     print(val_report)
     print(f"\nSaved model to {model_path}")
 
+    # Save validation predictions
+    pred_dir = output_cfg.get("predictions_dir")
+    if pred_dir:
+        pred_dir_path = Path(pred_dir)
+        pred_dir_path.mkdir(parents=True, exist_ok=True)
+        
+        val_out = meta_val.copy()
+        val_out["probability"] = val_proba
+        val_out["prediction"] = val_pred
+        val_out["target"] = y_val_hard.values
+        if use_label_smoothing:
+            val_out["target_smooth"] = y_val.values
+            
+        val_pred_path = pred_dir_path / "predictions_validation.parquet"
+        val_out.to_parquet(val_pred_path, index=False)
+        print(f"Saved validation predictions to {val_pred_path}")
+
     # Feature Importance
     print("\n" + "=" * 60)
     print("FEATURE IMPORTANCE")
@@ -161,7 +189,7 @@ def train_model(config: Dict) -> None:
     fi_df = fi_df.sort_values(by="importance", ascending=False)
     
     print(fi_df.head(20).to_string(index=False))
-    
+
     fi_path = model_path.with_suffix(".importance.csv")
     fi_df.to_csv(fi_path, index=False)
     print(f"\nSaved feature importance to {fi_path}")
@@ -171,13 +199,14 @@ def main() -> None:
     print("MODEL TRAINING (NEW CLIMATE SOURCE)")
     print("=" * 60)
 
-    parser = argparse.ArgumentParser(description="Train CatBoost heatwave model with new data")
-    parser.add_argument("--config", default="config_climate_coldwaves.yaml", help="Path to config YAML")
+    parser = argparse.ArgumentParser(description="Train CatBoost event model with new data")
+    parser.add_argument("--config", default="configs/config_climate_coldwaves.yaml", help="Path to config YAML")
     args = parser.parse_args()
 
     print(f"Loading config from: {args.config}")
     config = load_config(args.config)
     print("Config loaded successfully.")
+    
     train_model(config)
 
 if __name__ == "__main__":

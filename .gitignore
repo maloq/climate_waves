@@ -6,3 +6,4 @@ cache
 *.parquet
 *.nc
 **/*.parquet
+*.png

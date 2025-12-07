@@ -43,7 +43,7 @@ def evaluate_year(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate trained model on holdout years (New Climate Source)")
-    parser.add_argument("--config", default="config_climate.yaml", help="Path to config YAML")
+    parser.add_argument("--config", default="configs/config_climate_coldwaves.yaml", help="Path to config YAML")
     args = parser.parse_args()
 
     config = load_config(args.config)

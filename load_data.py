@@ -177,10 +177,10 @@ def apply_label_smoothing(
     min_smooth_value: float = 0.0,
     verbose: bool = True,
 ) -> pd.Series:
-    """Apply spatio-temporal label smoothing to binary heatwave labels.
+    """Apply spatio-temporal label smoothing to binary labels.
     
-    Instead of hard 0/1 targets, this "smears" the heatwave label into 
-    surrounding days and locations. A day next to a heatwave becomes 
+    Instead of hard 0/1 targets, this "smears" the label into 
+    surrounding days and locations. A day next to a label becomes 
     intermediate values (e.g., 0.3 or 0.5) instead of hard 0.
     
     The smoothing uses Gaussian kernels for both temporal and spatial dimensions.
@@ -271,7 +271,7 @@ def apply_label_smoothing(
                 truncate=spatial_radius / spatial_sigma if spatial_sigma > 0 else 3.0
             )
     
-    # Ensure original heatwave days (y=1) retain high values
+    # Ensure original events (y=1) retain high values
     # Take maximum of smoothed value and original label
     grid_final = np.maximum(grid_smoothed, grid_for_smooth)
     
@@ -305,9 +305,9 @@ def compute_smooth_weights(
     max_weight: float = 5.0,
     verbose: bool = True,
 ) -> np.ndarray:
-    """Compute sample weights based on proximity to heatwave events.
+    """Compute sample weights based on proximity to events.
     
-    Samples near (but not on) heatwave days get higher weights, helping the
+    Samples near (but not on) events get higher weights, helping the
     model learn the transition zones better.
     
     Args:
@@ -648,10 +648,36 @@ def load_single_year(
             
             features = features.load()
             target = target.load()
+
+            # Fix for January missing values: Load previous year context if available
+            prev_year = year - 1
+            prev_feature_path = Path(data_cfg["features_dir"]) / data_cfg["feature_file_template"].format(year=prev_year)
+            
+            if prev_feature_path.exists():
+                if verbose:
+                    print(f" (found context: {prev_year})", end="")
+                with xr.open_dataset(prev_feature_path, **engine_kwargs) as features_prev:
+                    if "date" in features_prev.coords: features_prev = features_prev.rename({"date": "time"})
+                    # Align valid_time if needed (simplified check)
+                    if "valid_time" in features_prev.coords and "time" not in features_prev.coords:
+                         features_prev = features_prev.rename({"valid_time": "time"})
+                    elif "valid_time" in features_prev.coords and "time" in features_prev.coords:
+                         features_prev = features_prev.drop_dims("valid_time", errors="ignore") # Simplified alignment for context
+
+                    features_prev = _subset_region(features_prev, lat_range, lon_range)
+                    features_prev = features_prev.load()
+                    
+                    # Concatenate along time
+                    features = xr.concat([features_prev, features], dim="time")
             
             # Feature Engineering (Full)
             if apply_feature_engineering:
                 features = engineer_features(features, config.get("feature_engineering", {}))
+            
+            # Slice back to the current year
+            start_date = pd.Timestamp(f"{year}-01-01")
+            end_date = pd.Timestamp(f"{year}-12-31")
+            features = features.sel(time=slice(start_date, end_date))
             
             # Merge
             merged = xr.merge([features, target[[target_var]]], join="inner")

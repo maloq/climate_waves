@@ -1,21 +1,24 @@
 data:
   features_dir: /home/infres/vmorozov/Misc/data/climate_data_files/ECMWF
   feature_file_template: "{variable}/{variable}_*.zarr" # Pattern to find files, though load_climate_data will handle it
-  target_dir: climate_data/target/target_fg10_north
-  target_file_template: "binary_daily_data_fg10_21_{year}.nc" # Keep target as is for now
-  target_var: fg10
+  target_dir: climate_data/target/target_cold_waves_span_30_threshold_7
+  target_file_template: "extemp_minus_7_{year}.nc" # Keep target as is for now
+  target_var: extemp_minus
   latitude_range: [40.0, 60.0]
   longitude_range: [30.0, 120.0]
   train_years: [2017, 2018, 2019, 2020, 2021, 2022]
   test_years: [2023, 2024]
   sample_fraction: 1.0
   random_seed: 42
+  interpolate: false
 
 features:
 - t2m
 - d2m
 - tp
 - stl1
+- u10
+- v10
 
 # Feature engineering configuration
 feature_engineering:
@@ -34,6 +37,9 @@ feature_engineering:
       - t2m
       - d2m
       - stl1
+      - u10
+      - v10
+      - tp
     lags: [1, 3, 7]
 
   # EWM
@@ -43,6 +49,8 @@ feature_engineering:
       - stl1
       - tp
       - d2m
+      - u10
+      - v10
     spans: [3, 7, 14, 30]
 
   # Spatial stats
@@ -51,6 +59,8 @@ feature_engineering:
       - t2m
       - d2m
       - tp
+      - u10
+      - v10
     window_sizes: [5, 11]
     stats: [mean, std]
 
@@ -61,6 +71,8 @@ feature_engineering:
       - d2m
       - tp
       - stl1
+      - u10
+      - v10
 
   # Temporal diff
   temporal_diff:
@@ -69,6 +81,8 @@ feature_engineering:
       - d2m
       - tp
       - stl1
+      - u10
+      - v10
     periods: [1, 3, 7, 14, 30]
 
 label_smoothing:

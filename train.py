@@ -178,8 +178,8 @@ def main() -> None:
     print("MODEL TRAINING")
     print("=" * 60)
 
-    parser = argparse.ArgumentParser(description="Train CatBoost heatwave model")
-    parser.add_argument("--config", default="config.yaml", help="Path to config YAML")
+    parser = argparse.ArgumentParser(description="Train CatBoost event model")
+    parser.add_argument("--config", default="configs/config_coldwave.yaml", help="Path to config YAML")
     args = parser.parse_args()
 
     print(f"Loading config from: {args.config}")

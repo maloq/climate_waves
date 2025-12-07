@@ -1,5 +1,5 @@
 """
-Optuna hyperparameter optimization for heatwave prediction model.
+Optuna hyperparameter optimization for event prediction model.
 
 Optimizes:
 1. Feature selection (which base columns to include)
@@ -544,7 +544,7 @@ class OptunaObjective:
 def run_optimization(
     config_path: str = "config.yaml",
     n_trials: int = 100,
-    study_name: str = "heatwave_optimization",
+    study_name: str = "event_optimization",
     storage: str | None = None,
     output_path: str = "optimized_params.yaml",
     metric: str = "f1",

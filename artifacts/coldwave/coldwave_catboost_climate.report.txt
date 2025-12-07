@@ -1,0 +1,25 @@
+Training classification report
+Decision threshold: 0.5
+
+              precision    recall  f1-score   support
+
+           0       0.99      0.96      0.98   3238260
+           1       0.53      0.75      0.62    172492
+
+    accuracy                           0.95   3410752
+   macro avg       0.76      0.86      0.80   3410752
+weighted avg       0.96      0.95      0.96   3410752
+
+============================================================
+
+Validation classification report
+Decision threshold: 0.5
+
+              precision    recall  f1-score   support
+
+           0       0.98      0.96      0.97    809566
+           1       0.52      0.72      0.60     43123
+
+    accuracy                           0.95    852689
+   macro avg       0.75      0.84      0.79    852689
+weighted avg       0.96      0.95      0.96    852689

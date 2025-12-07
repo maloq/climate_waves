@@ -1,15 +1,16 @@
 data:
   features_dir: /home/infres/vmorozov/Misc/data/climate_data_files/ECMWF
   feature_file_template: "{variable}/{variable}_*.zarr" # Pattern to find files, though load_climate_data will handle it
-  target_dir: climate_data/target/target_heat_waves_1984_span_30_threshold_7
-  target_file_template: "extemp_7_{year}.nc" # Keep target as is for now
-  target_var: extemp
+  target_dir: climate_data/target/target_fg10_north
+  target_file_template: "binary_daily_data_fg10_21_{year}.nc" # Keep target as is for now
+  target_var: fg10
   latitude_range: [40.0, 60.0]
   longitude_range: [30.0, 120.0]
   train_years: [2017, 2018, 2019, 2020, 2021, 2022]
   test_years: [2023, 2024]
   sample_fraction: 1.0
   random_seed: 42
+  interpolate: false
 
 features:
 - t2m
@@ -105,5 +106,5 @@ training:
   class_weights: null
 
 output:
-  model_path: artifacts/heatwave/heatwave_catboost_climate.cbm
-  predictions_dir: artifacts/heatwave/predictions_climate
+  model_path: artifacts/wind/wind_catboost_climate.cbm
+  predictions_dir: artifacts/wind/predictions_climate
