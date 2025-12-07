@@ -222,6 +222,49 @@ def load_years(
     exact_end = pd.Timestamp(f"{end_year}-12-31")
     ds_features = ds_features.sel(time=slice(exact_start, exact_end))
 
+    # --- NEW: Interpolate features to target resolution ---
+    if verbose:
+        print("  Interpolating features to target grid...", end=" ", flush=True)
+
+    # Find a sample target file to get the grid
+    sample_target_path = None
+    target_path_template = pathlib.Path(data_cfg["target_dir"]) / data_cfg["target_file_template"]
+    for yr in years:
+        p = pathlib.Path(str(target_path_template).format(year=yr))
+        if p.exists():
+            sample_target_path = p
+            break
+            
+    if sample_target_path:
+        with xr.open_dataset(sample_target_path) as ds_t_sample:
+            # Standardize coords in sample
+            if "date" in ds_t_sample.coords: ds_t_sample = ds_t_sample.rename({"date": "time"})
+            # Rename lat/lon if needed to match features (latitude/longitude)
+            rename_dict = {}
+            if "lat" in ds_t_sample.coords and "latitude" not in ds_t_sample.coords: rename_dict["lat"] = "latitude"
+            if "lon" in ds_t_sample.coords and "longitude" not in ds_t_sample.coords: rename_dict["lon"] = "longitude"
+            if rename_dict:
+                ds_t_sample = ds_t_sample.rename(rename_dict)
+                
+            # Subset to config range (same as we do for targets later)
+            ds_t_sample = _subset_region(ds_t_sample, lat_range, lon_range)
+            
+            # Extract grid
+            target_lats = ds_t_sample["latitude"]
+            target_lons = ds_t_sample["longitude"]
+            
+            # Interpolate
+            ds_features = ds_features.interp(
+                latitude=target_lats, 
+                longitude=target_lons, 
+                method="linear"
+            )
+        if verbose:
+            print(f"done. (Grid: {len(target_lats)}x{len(target_lons)})")
+    else:
+        print("Warning: Could not find any target files to determine grid for interpolation!")
+    # ------------------------------------------------------
+
     # 5. Load Targets for each year and merge
     if verbose:
         print("  Loading targets...", end=" ", flush=True)
