@@ -1,0 +1,83 @@
+data:
+  feature_file_template: '{variable}/{variable}_*.zarr'
+  features: &id001
+  - t2m
+  - d2m
+  - stl1
+  features_dir: /home/infres/vmorozov/Misc/data/climate_data_files/ECMWF
+  latitude_range:
+  - 40.0
+  - 60.0
+  longitude_range:
+  - 30.0
+  - 120.0
+  random_seed: 42
+  sample_fraction: 1.0
+  target_dir: climate_data/target/target_heat_waves_1984_span_30_threshold_7
+  target_file_template: extemp_7_{year}.nc
+  target_var: extemp
+  test_years:
+  - 2023
+  - 2024
+  train_years:
+  - 2017
+  - 2018
+  - 2019
+  - 2020
+  - 2021
+  - 2022
+feature_engineering:
+  enabled: true
+  ewm:
+    spans:
+    - 3
+    variables:
+    - stl1
+  gradients:
+    variables:
+    - t2m
+    - stl1
+  lag: {}
+  spatial: {}
+  temporal:
+    day_of_year: false
+    month: true
+    sin_cos_annual: false
+    sin_cos_semiannual: false
+  temporal_diff:
+    periods:
+    - 1
+    variables:
+    - t2m
+features: *id001
+label_smoothing:
+  enabled: false
+  max_smooth_value: 1.0
+  min_smooth_value: 0.0
+  spatial_radius: 2
+  spatial_sigma: 1.0
+  temporal_radius: 3
+  temporal_sigma: 1.5
+model:
+  bootstrap_type: Bernoulli
+  class_weight_ratio: 6.14
+  decision_threshold: 0.38493564427131044
+  depth: 5
+  eval_metric: F1
+  grow_policy: SymmetricTree
+  iterations: 600
+  l2_leaf_reg: 0.2051110418843398
+  learning_rate: 0.04725396149933918
+  loss_function: Logloss
+  min_data_in_leaf: 6
+  random_seed: 42
+  task_type: GPU
+  use_class_weights: true
+  verbose: true
+output:
+  model_path: artifacts/heatwave_catboost_climate.cbm
+  predictions_dir: artifacts/predictions_climate
+training:
+  class_weights: null
+  shuffle: true
+  validation_size: 0.2

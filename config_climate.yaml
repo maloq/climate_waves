@@ -1,0 +1,109 @@
+data:
+  features_dir: /home/infres/vmorozov/Misc/data/climate_data_files/ECMWF
+  feature_file_template: "{variable}/{variable}_*.zarr" # Pattern to find files, though load_climate_data will handle it
+  target_dir: climate_data/target/target_heat_waves_1984_span_30_threshold_7
+  target_file_template: "extemp_7_{year}.nc" # Keep target as is for now
+  target_var: extemp
+  latitude_range: [40.0, 60.0]
+  longitude_range: [30.0, 120.0]
+  train_years: [2017, 2018, 2019, 2020, 2021, 2022]
+  test_years: [2023, 2024]
+  sample_fraction: 1.0
+  random_seed: 42
+
+features:
+- t2m
+- d2m
+- tp
+- stl1
+
+# Feature engineering configuration
+feature_engineering:
+  enabled: true
+  
+  # Temporal/seasonality
+  temporal:
+    month: true
+    day_of_year: true
+    sin_cos_annual: true
+    sin_cos_semiannual: false
+  
+  # Lags
+  lag:
+    variables:
+      - t2m
+      - d2m
+      - stl1
+    lags: [1, 3, 7]
+
+  # EWM
+  ewm:
+    variables:
+      - t2m
+      - stl1
+      - tp
+      - d2m
+    spans: [3, 7, 14, 30]
+
+  # Spatial stats
+  spatial:
+    variables:
+      - t2m
+      - d2m
+      - tp
+    window_sizes: [5, 11]
+    stats: [mean, std]
+
+  # Gradients
+  gradients:
+    variables:
+      - t2m
+      - d2m
+      - tp
+      - stl1
+
+  # Temporal diff
+  temporal_diff:
+    variables:
+      - t2m
+      - d2m
+      - tp
+      - stl1
+    periods: [1, 3, 7, 14, 30]
+
+label_smoothing:
+  enabled: false
+  temporal_sigma: 1.5
+  temporal_radius: 3
+  spatial_sigma: 1.0
+  spatial_radius: 2
+  max_smooth_value: 1.0
+  min_smooth_value: 0.0
+
+model:
+  iterations: 1200
+  learning_rate: 0.082
+  depth: 6
+  loss_function: Logloss
+  eval_metric: F1
+  l2_leaf_reg: 1.128
+  random_seed: 42
+  task_type: GPU
+  decision_threshold: 0.512
+  verbose: 10
+  bootstrap_type: Bayesian
+  bagging_temperature: 1.49
+  use_class_weights: true
+  class_weight_ratio: 6.14
+  grow_policy: Lossguide
+  max_leaves: 18
+  min_data_in_leaf: 46
+
+training:
+  validation_size: 0.2
+  shuffle: true
+  class_weights: null
+
+output:
+  model_path: artifacts/heatwave_catboost_climate.cbm
+  predictions_dir: artifacts/predictions_climate

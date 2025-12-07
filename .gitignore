@@ -6,4 +6,3 @@ cache
 *.parquet
 *.nc
 **/*.parquet
-wildfires_project
