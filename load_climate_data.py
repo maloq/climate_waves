@@ -19,7 +19,7 @@ from load_data import _subset_region, apply_label_smoothing, load_config
 from feature_engineering import engineer_features
 
 CACHE_DIR = pathlib.Path("cache/climate_data")
-CACHE_LIMIT_GB = 20
+CACHE_LIMIT_GB = 30
 
 def get_config_hash(config: Dict, years: List[int]) -> str:
     """Generates a stable hash for the data configuration + specific years."""
@@ -152,6 +152,61 @@ def load_zarr_dataset(
     # Merge all variables into one Dataset
     return xr.merge(datasets, join='inner')
 
+def load_netcdf_features_lazy(
+    years: Iterable[int],
+    feature_dir: str,
+    file_template: str,
+    lat_range: Tuple[float, float],
+    lon_range: Tuple[float, float],
+    variables: List[str]
+) -> xr.Dataset:
+    """
+    Loads features from NetCDF files lazily (Legacy support).
+    """
+    files = []
+    # Load requested years
+    unique_years = sorted(list(set(years)))
+    
+    for yr in unique_years:
+        fpath = pathlib.Path(feature_dir) / file_template.format(year=yr)
+        if fpath.exists():
+            files.append(str(fpath))
+    
+    if not files:
+        print(f"Warning: No NetCDF files found for years {unique_years} at {feature_dir}")
+        return xr.Dataset()
+
+    # Open MFDataset
+    # Parallel=False to avoid threading issues inside agents or limited environments
+    # Use nested combine to avoid strict coordinate equality checks across files (floating point jitter)
+    ds = xr.open_mfdataset(
+        files, 
+        combine="nested", 
+        concat_dim="date", # We know files are split by year and use 'date'
+        chunks="auto", 
+        parallel=False
+    )
+    
+    if "date" in ds.coords: ds = ds.rename({"date": "time"})
+    
+    # Filter variables that actually exist in the dataset
+    available_vars = [v for v in variables if v in ds.data_vars]
+    if available_vars:
+        ds = ds[available_vars]
+    else:
+        print(f"Warning: None of requested variables {variables} found in NetCDF files.")
+        return xr.Dataset()
+        
+    ds = _subset_region(ds, lat_range, lon_range)
+    
+    rename_dict = {}
+    if 'lat' in ds.coords and 'latitude' not in ds.coords: rename_dict['lat'] = 'latitude'
+    if 'lon' in ds.coords and 'longitude' not in ds.coords: rename_dict['lon'] = 'longitude'
+    if rename_dict:
+        ds = ds.rename(rename_dict)
+        
+    return ds
+
 def load_targets_lazy(
     years: Iterable[int],
     target_dir: str,
@@ -206,6 +261,33 @@ def load_years(
     
     sample_fraction = kwargs.get("sample_fraction", data_cfg.get("sample_fraction", 1.0))
     random_seed = kwargs.get("random_seed", data_cfg.get("random_seed", 42))
+    target_var = data_cfg["target_var"]
+
+    # Check if label smoothing is enabled
+    ls_config = config.get("label_smoothing", {})
+    ls_enabled = ls_config.get("enabled", False) and apply_label_smoothing_flag
+
+    def _apply_chunk_smoothing(df_chunk: pd.DataFrame) -> pd.DataFrame:
+        if verbose: print(f"    [Smoothing] Applying to {len(df_chunk):,} samples...", end=" ", flush=True)
+        
+        # Preserve hard labels
+        if f"{target_var}_hard" not in df_chunk.columns:
+            df_chunk[f"{target_var}_hard"] = df_chunk[target_var]
+            
+        y_smooth = apply_label_smoothing(
+             df_chunk[target_var],
+             df_chunk[["time", "latitude", "longitude"]],
+             temporal_sigma=ls_config.get("temporal_sigma", 1.0),
+             temporal_radius=ls_config.get("temporal_radius", 3),
+             spatial_sigma=ls_config.get("spatial_sigma", 1.0),
+             spatial_radius=ls_config.get("spatial_radius", 1),
+             max_smooth_value=ls_config.get("max_smooth_value", 1.0),
+             min_smooth_value=ls_config.get("min_smooth_value", 0.0),
+             verbose=False 
+        )
+        df_chunk[target_var] = y_smooth
+        if verbose: print("done.")
+        return df_chunk
     
     # --- Caching Setup ---
     cache_subdir = None
@@ -249,6 +331,12 @@ def load_years(
                     cache_file.touch()
                     df_year = pd.read_parquet(cache_file)
                     
+                    if ls_enabled:
+                         try:
+                             df_year = _apply_chunk_smoothing(df_year)
+                         except Exception as e:
+                             print(f"Warning: Label smoothing failed for cached year {yr}: {e}")
+
                     if sample_fraction < 1.0 and not df_year.empty:
                         df_year = df_year.sample(frac=sample_fraction, random_state=random_seed)
                     
@@ -267,9 +355,58 @@ def load_years(
         if verbose:
             print(f"Loading Raw Data for {years_to_compute} (Buffer: {buffer_days}d)")
 
-        ds_features_global = load_zarr_dataset(
-            data_cfg["features_dir"], variables, lat_range, lon_range
-        )
+        # Split variables into Zarr vs NetCDF
+        zarr_vars = []
+        netcdf_vars = []
+        
+        for var in variables:
+            # Check Zarr
+            search_path = os.path.join(data_cfg["features_dir"], var, f"{var}_*.zarr")
+            if glob.glob(search_path) or glob.glob(os.path.join(data_cfg["features_dir"], "**", f"{var}_*.zarr"), recursive=True):
+                zarr_vars.append(var)
+            else:
+                netcdf_vars.append(var)
+        
+        if verbose:
+            print(f"  Zarr variables: {len(zarr_vars)}")
+            print(f"  NetCDF variables: {len(netcdf_vars)}")
+
+        ds_list = []
+        
+        # Load Zarr
+        if zarr_vars:
+            # Revert to old valid load_zarr_dataset call if I don't change that function
+            ds_zarr = load_zarr_dataset(
+                data_cfg["features_dir"], zarr_vars, lat_range, lon_range
+            )
+            ds_list.append(ds_zarr)
+            
+        # Load NetCDF
+        if netcdf_vars:
+            unique_load_years = set(years_to_compute)
+            if buffer_days > 0:
+                min_yr = min(years_to_compute)
+                unique_load_years.add(min_yr - 1)
+            
+            ds_nc = load_netcdf_features_lazy(
+                list(unique_load_years), 
+                "climate_data/features", 
+                "features_{year}.nc",
+                lat_range, lon_range, 
+                netcdf_vars
+            )
+            if ds_nc.nbytes > 0 or len(ds_nc) > 0:
+                 ds_list.append(ds_nc)
+
+        if not ds_list:
+             raise ValueError("Failed to load any features (Zarr or NetCDF).")
+
+        # Merge global features
+        if len(ds_list) > 1:
+            ds_features_global = xr.merge(ds_list, join='inner')
+        else:
+            ds_features_global = ds_list[0]
+
         ds_targets_global = load_targets_lazy(
             years_to_compute, data_cfg["target_dir"], data_cfg["target_file_template"], lat_range, lon_range
         )
@@ -298,19 +435,40 @@ def load_years(
                 print(f"No target data for {yr}, skipping.")
                 continue
 
-            # B. Feature Engineering (Lazy)
+            # B. Feature Engineering (Lazy -> Eager to fix Dask issues)
             if fe_enabled:
+                if verbose: print("    [Compute] Materializing chunk for feature engineering...", end=" ", flush=True)
+                ds_chunk_feat = ds_chunk_feat.compute()
+                if verbose: print("done.")
                 ds_chunk_feat = engineer_features(ds_chunk_feat, fe_config)
                 
             # C. Align
-            # Select common times
-            ds_chunk_feat = ds_chunk_feat.sel(time=ds_chunk_target.time)
+            # Select common times (Nearest match to handle offsets like 09:00 vs 00:00)
+            try:
+                # FAST PATH: Standard selection (Works if all target times have matching features within tolerance)
+                ds_chunk_feat_aligned = ds_chunk_feat.sel(time=ds_chunk_target.time, method='nearest', tolerance="12h")
+                ds_chunk_feat = ds_chunk_feat_aligned
+            except KeyError:
+                # SLOW PATH (Fallback): Missing features for some target times (e.g. 2024 gap)
+                # Use reindex to create NaNs, then drop them
+                if verbose: print(f"  [Warning] Missing features for some timestamps in {yr}. Dropping incomplete samples...", end=" ")
+                ds_chunk_feat = ds_chunk_feat.reindex(time=ds_chunk_target.time, method='nearest', tolerance="12h")
+                
+                # Drop times where ALL features/spatial points are NaN (i.e. the ones inserted by reindex)
+                # Note: This assumes valid time steps have at least SOME non-NaN data.
+                ds_chunk_feat = ds_chunk_feat.dropna(dim='time', how='all')
+                
+                # Sync target to match remaining feature times
+                ds_chunk_target = ds_chunk_target.sel(time=ds_chunk_feat.time)
+                
+                if verbose: print(f"Retained {ds_chunk_target.time.size} samples.")
+            ds_chunk_feat['time'] = ds_chunk_target.time
             
             # Reindex features to target grid (Spatial align)
             ds_chunk_feat = ds_chunk_feat.reindex(
                 latitude=ds_chunk_target.latitude, 
                 longitude=ds_chunk_target.longitude, 
-                method='nearest', tolerance=0.01
+                method='nearest', tolerance=0.6
             )
             
             # Merge
@@ -339,7 +497,11 @@ def load_years(
                  except Exception as e:
                      print(f"Warning: Could not save to cache: {e}")
 
-            # F. Subsample In-Memory (Fast)
+            # F. Label Smoothing (BEFORE Subsampling)
+            if ls_enabled:
+                 df_year = _apply_chunk_smoothing(df_year)
+
+            # G. Subsample In-Memory (Fast)
             if sample_fraction < 1.0 and not df_year.empty:
                 df_year = df_year.sample(frac=sample_fraction, random_state=random_seed)
                 
@@ -368,22 +530,14 @@ def load_years(
     
     X = df_final.drop(columns=[c for c in drop_cols if c in df_final.columns])
 
-    # 7. Label Smoothing
-    y_hard = y.copy()
-    ls_enabled = config.get("label_smoothing", {}).get("enabled", False)
-    if ls_enabled and apply_label_smoothing_flag:
-         if verbose: print("  Applying label smoothing...")
-         ls_cfg = config["label_smoothing"]
-         y = apply_label_smoothing(
-             y, meta,
-             temporal_sigma=ls_cfg.get("temporal_sigma", 1.0),
-             temporal_radius=ls_cfg.get("temporal_radius", 3),
-             spatial_sigma=ls_cfg.get("spatial_sigma", 1.0),
-             spatial_radius=ls_cfg.get("spatial_radius", 1),
-             max_smooth_value=ls_cfg.get("max_smooth_value", 1.0),
-             min_smooth_value=ls_cfg.get("min_smooth_value", 0.0),
-             verbose=verbose
-         )
+    # 7. Extract Labels (Handle Soft vs Hard)
+    # y is now potentially smoothed (if ls_enabled was True)
+    # y_hard should be recovered from the extra column if it exists
+    
+    if f"{target_var}_hard" in df_final.columns:
+        y_hard = df_final[f"{target_var}_hard"].copy()
+    else:
+        y_hard = y.copy() # No smoothing or only hard labels available
 
     if return_hard_labels and return_metadata:
         return X, y, meta, y_hard

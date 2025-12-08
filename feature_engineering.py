@@ -15,8 +15,10 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 import warnings
 
+
 import numpy as np
 import xarray as xr
+import os
 
 try:
     from numba import jit, prange
@@ -698,6 +700,294 @@ def compute_anomalies(
     return ds.assign(**result_vars)
 
 
+
+# =============================================================================
+# EXPLICIT ANOMALIES (CLIMATOLOGY)
+# =============================================================================
+
+def compute_daily_climatology_anomalies(
+    ds: xr.Dataset,
+    variables: List[str],
+    climatology_path: Optional[str] = None,
+    time_dim: str = "time",
+    suffix: str = "_anom",
+) -> xr.Dataset:
+    """Compute anomalies by subtracting daily climatology.
+    
+    Args:
+        ds: Input dataset
+        variables: Variables to compute anomalies for
+        climatology_path: Path to the climatology NetCDF file (optional)
+        time_dim: Time dimension name
+        suffix: Suffix for anomaly features
+    
+    Returns:
+        Dataset with anomaly features
+    """
+    result_vars = {}
+    
+    climatology_ds = None
+    if climatology_path and os.path.exists(climatology_path):
+        try:
+            climatology_ds = xr.open_dataset(climatology_path)
+            # Ensure dayofyear is the dimension
+            if "dayofyear" not in climatology_ds.coords:
+                 # Check if we can rename
+                 pass
+        except Exception as e:
+            warnings.warn(f"Failed to load climatology from {climatology_path}: {e}")
+    
+    for var in variables:
+        if var not in ds.data_vars:
+            warnings.warn(f"Variable '{var}' not found, skipping climatology anomaly")
+            continue
+        
+        data = ds[var]
+        
+        # FIX: Ensure time dimension is single chunk to avoid "chunks do not add up to shape" error
+        # in dask groupby subtraction. Since we process year-by-year, this is memory-safe.
+        if data.chunks is not None: 
+            data = data.chunk({time_dim: -1})
+        
+        # Calculate dayofyear for the input data
+        # We need to broadcast climatology to the input data shape based on dayofyear
+        
+        if climatology_ds is not None and var in climatology_ds:
+            clim = climatology_ds[var]
+            # Group by dayofyear is not strictly necessary if we can select
+            # But xarray selection by dayofyear is tricky if dimensions don't match exactly
+            # Easier approach: Use xarray's advanced indexing or groupby subtraction
+            
+            # This subtracts the mean corresponding to the dayofyear of each simple
+            anomaly = data.groupby(f"{time_dim}.dayofyear") - clim
+            # Drop the dayofyear coordinate added by groupby
+            if "dayofyear" in anomaly.coords:
+                anomaly = anomaly.drop_vars("dayofyear")
+                
+        else:
+            # Fallback: Compute self-climatology (mean over loaded data)
+            # Only useful if loading many years, otherwise might be biased
+            warnings.warn(f"No external climatology for {var}, using self-mean (may be biased if data is short)")
+            clim = data.groupby(f"{time_dim}.dayofyear").mean(dim=time_dim)
+            anomaly = data.groupby(f"{time_dim}.dayofyear") - clim
+            if "dayofyear" in anomaly.coords:
+                anomaly = anomaly.drop_vars("dayofyear")
+
+        result_vars[f"{var}{suffix}"] = anomaly
+    
+    return ds.assign(**result_vars)
+
+
+# =============================================================================
+# WIND CHILL INDEX
+# =============================================================================
+
+def compute_wind_chill(
+    ds: xr.Dataset,
+    temp_var: str,
+    u_var: str,
+    v_var: str,
+    new_name: str = "wind_chill_index",
+) -> xr.Dataset:
+    """Compute Wind Chill Index.
+    
+    Formula: 13.12 + 0.6215*T - 11.37*V^0.16 + 0.3965*T*V^0.16
+    Where T is Temperature in Celsius, V is Wind Speed in km/h.
+    
+    Args:
+        ds: Input dataset
+        temp_var: Name of temperature variable (assumed Kelvin if > 200, else Celsius)
+        u_var: U component of wind (m/s)
+        v_var: V component of wind (m/s)
+        new_name: Name of the output feature
+        
+    Returns:
+        Dataset with wind chill feature
+    """
+    if not all(v in ds.data_vars for v in [temp_var, u_var, v_var]):
+        warnings.warn(f"Missing variables for wind chill ({temp_var}, {u_var}, {v_var}), skipping")
+        return ds
+
+    T = ds[temp_var]
+    U = ds[u_var]
+    V_vec = ds[v_var]
+    
+    # 1. Convert Temperature to Celsius if needed
+    # Simple heuristic: if mean is > 200, it's likely Kelvin
+    if T.mean() > 200:
+        T_c = T - 273.15
+    else:
+        T_c = T
+        
+    # 2. Compute Wind Magnitude (Speed)
+    V_ms = np.sqrt(U**2 + V_vec**2)
+    
+    # 3. Convert Wind Speed to km/h
+    V_kmh = V_ms * 3.6
+    
+    # 4. Limit V for valid formula application? 
+    # The formula is technically valid for V > 4.8 km/h and T < 10C, 
+    # but we'll apply it everywhere as a continuous feature for ML.
+    # To avoid complex numbers with negative base (unlikely for magnitude), ensure V >= 0.
+    # To avoid division by zero or weird power behavior near 0, clip V? 
+    # V^0.16 is safe for V >= 0.
+    
+    V_pow = V_kmh ** 0.16
+    
+    wchill = 13.12 + 0.6215 * T_c - 11.37 * V_pow + 0.3965 * T_c * V_pow
+    
+    return ds.assign(**{new_name: wchill})
+
+
+# =============================================================================
+# TEMPERATURE ADVECTION
+# =============================================================================
+
+def compute_temperature_advection(
+    ds: xr.Dataset,
+    temp_var: str,
+    u_var: str,
+    v_var: str,
+    lat_dim: str = "latitude",
+    lon_dim: str = "longitude",
+    new_name: str = "temp_advection",
+) -> xr.Dataset:
+    """Compute Temperature Advection: - (u * dT/dx + v * dT/dy).
+    
+    Requires converting spatial gradients from degrees to meters.
+    
+    Args:
+        ds: Input dataset
+        temp_var: Temperature variable
+        u_var: U component of wind (m/s)
+        v_var: V component of wind (m/s)
+        lat_dim: Latitude dimension name
+        lon_dim: Longitude dimension name
+        new_name: Output feature name
+        
+    Returns:
+        Dataset with advection feature
+    """
+    if not all(v in ds.data_vars for v in [temp_var, u_var, v_var]):
+        warnings.warn(f"Missing variables for advection ({temp_var}, {u_var}, {v_var}), skipping")
+        return ds
+        
+    T = ds[temp_var]
+    U = ds[u_var] # m/s (zonal, West->East)
+    V = ds[v_var] # m/s (meridional, South->North)
+    
+    if lat_dim not in ds.coords or lon_dim not in ds.coords:
+        warnings.warn("Lat/Lon coordinates needed for advection, skipping")
+        return ds
+
+    # Gradients in coordinate space (dT/dlat, dT/dlon)
+    # xarray's differentiate or numpy gradient
+    # differentiate returns change per unit coordinate (per degree)
+    
+    dT_dlat = T.differentiate(lat_dim)
+    dT_dlon = T.differentiate(lon_dim)
+    
+    # Conversion factors (degrees -> meters)
+    # R_earth approx 6371000 m
+    # dy = R * dlat (in radians)
+    # dx = R * cos(lat) * dlon (in radians)
+    
+    # 1 deg = pi / 180 radians
+    deg2rad = np.pi / 180.0
+    R = 6371000.0
+    
+    meters_per_lat = R * deg2rad # Constant ~111km
+    
+    # meters_per_lon varies with latitude
+    lat_rad = np.deg2rad(ds.coords[lat_dim])
+    meters_per_lon = R * np.cos(lat_rad) * deg2rad
+    
+    # Gradients in meters: dT/dy = (dT/dlat) / (meters/degree)
+    dT_dx = dT_dlon / meters_per_lon
+    dT_dy = dT_dlat / meters_per_lat
+    
+    # Advection = - (u * dT/dx + v * dT/dy)
+    # u is zonal (x), v is meridional (y)
+    
+    adv = - (U * dT_dx + V * dT_dy)
+    
+    return ds.assign(**{new_name: adv})
+
+
+# =============================================================================
+# REGIONAL / GLOBAL AGGREGATIONS
+# =============================================================================
+
+def compute_regional_features(
+    ds: xr.Dataset,
+    variables: List[str],
+    stats: List[str] = ["mean", "std", "min", "max"],
+    suffix_template: str = "_global_{stat}",
+    lat_dim: str = "latitude",
+    lon_dim: str = "longitude",
+) -> xr.Dataset:
+    """Compute global/regional aggregated features (e.g. mean over entire domain).
+    
+    Captures macro-scale context (e.g. is the whole region cold?).
+    
+    Args:
+        ds: Input dataset
+        variables: Variables to aggregate
+        stats: List of statistics to compute ("mean", "std", "min", "max")
+        suffix_template: Template for naming features
+        lat_dim: Latitude dimension name
+        lon_dim: Longitude dimension name
+        
+    Returns:
+        Dataset with global feature channels (broadcast to original shape)
+    """
+    result_vars = {}
+    
+    for var in variables:
+        if var not in ds.data_vars:
+            warnings.warn(f"Variable '{var}' not found, skipping regional stats")
+            continue
+            
+        data = ds[var]
+        dims = data.dims
+        
+        # Check spatial dims
+        if lat_dim not in dims or lon_dim not in dims:
+            warnings.warn(f"Spatial dimensions not found for {var}, skipping regional stats")
+            continue
+            
+        spatial_dims = (lat_dim, lon_dim)
+        
+        for stat in stats:
+            # Compute scalar (per time step)
+            if stat == "mean":
+                agg = data.mean(dim=spatial_dims, skipna=True)
+            elif stat == "std":
+                agg = data.std(dim=spatial_dims, skipna=True)
+            elif stat == "min":
+                agg = data.min(dim=spatial_dims, skipna=True)
+            elif stat == "max":
+                agg = data.max(dim=spatial_dims, skipna=True)
+            else:
+                continue
+                
+            # Broadcast back to original shape
+            # xarray handles broadcasting automatically when assigning to dataset with aligned coords
+            # But we want to ensure it has the same dimensions as the original variable
+            # so it can be merged/stacked properly.
+            
+            # Note: agg has lost lat/lon dims. We assign it.
+            # xarray's broadcast mechanism:
+            
+            agg_broadcast, _ = xr.broadcast(agg, data)
+            
+            new_name = f"{var}{suffix_template.format(stat=stat)}"
+            result_vars[new_name] = agg_broadcast
+            
+    return ds.assign(**result_vars)
+
+
+
 # =============================================================================
 # TEMPORAL CHANGE FEATURES (DIFFERENCES)
 # =============================================================================
@@ -1005,7 +1295,52 @@ def engineer_features(
             time_dim=time_dim,
         )
     
-    # 6. Anomalies
+    # 6. Climatology Anomalies
+    if "climatology" in config:
+        clim_cfg = config["climatology"]
+        result = compute_daily_climatology_anomalies(
+            result,
+            variables=clim_cfg.get("variables", []),
+            climatology_path=clim_cfg.get("path", None),
+            time_dim=time_dim,
+        )
+
+    # 7. Wind Chill
+    if "wind_chill" in config:
+        wc_cfg = config["wind_chill"]
+        if wc_cfg.get("enabled", False):
+            result = compute_wind_chill(
+                result,
+                temp_var=wc_cfg.get("temp_var", "temperature_h00_lvl1000"),
+                u_var=wc_cfg.get("u_var", "u_component_of_wind_h00_lvl1000"),
+                v_var=wc_cfg.get("v_var", "v_component_of_wind_h00_lvl1000"),
+            )
+
+    # 8. Advection
+    if "advection" in config:
+        adv_cfg = config["advection"]
+        if adv_cfg.get("enabled", False):
+            result = compute_temperature_advection(
+                result,
+                temp_var=adv_cfg.get("temp_var", "temperature_h00_lvl1000"),
+                u_var=adv_cfg.get("u_var", "u_component_of_wind_h00_lvl1000"),
+                v_var=adv_cfg.get("v_var", "v_component_of_wind_h00_lvl1000"),
+                lat_dim=lat_dim,
+                lon_dim=lon_dim,
+            )
+
+    # 9. Regional/Global Features [NEW]
+    if "regional" in config:
+        reg_cfg = config["regional"]
+        result = compute_regional_features(
+            result,
+            variables=reg_cfg.get("variables", []),
+            stats=reg_cfg.get("stats", ["mean", "std", "min", "max"]),
+            lat_dim=lat_dim,
+            lon_dim=lon_dim,
+        )
+
+    # 9. Simple Mean Anomalies (Legacy)
     if "anomaly" in config:
         anom_cfg = config["anomaly"]
         result = compute_anomalies(
@@ -1166,5 +1501,24 @@ def get_feature_names(
             if var in base_features:
                 names.append(f"{var}_anom")
     
+    if "climatology" in config:
+        for var in config["climatology"].get("variables", []):
+            if var in base_features:
+                names.append(f"{var}_anom")
+
+    if "wind_chill" in config:
+        if config["wind_chill"].get("enabled", False):
+            names.append("wind_chill_index")
+
+    if "advection" in config:
+        if config["advection"].get("enabled", False):
+            names.append("temp_advection")
+
+    if "regional" in config:
+        for var in config["regional"].get("variables", []):
+            if var in base_features:
+                for stat in config["regional"].get("stats", ["mean", "std", "min", "max"]):
+                    names.append(f"{var}_global_{stat}")
+
     return names
 

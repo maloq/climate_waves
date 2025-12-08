@@ -59,12 +59,17 @@ def evaluate_year(
     print(f"  Added static features. Total features: {len(X.columns)}")
     # --------------------------------------
 
+
+
     proba = model.predict_proba(X)[:, 1]
     preds = (proba >= threshold).astype(int)
 
     report = classification_report(y, preds)
     print(f"Year {year} metrics:")
     print(report)
+    
+    # Calculate and print relaxed metrics
+    calculate_relaxed_metrics(y, preds, proba, meta, year)
 
     out = meta.copy()
     out["probability"] = proba
@@ -81,9 +86,71 @@ def evaluate_year(
     plot_monthly_maps(meta, y, proba, preds, year, pred_dir)
 
 
+def calculate_relaxed_metrics(y_true, y_pred, y_proba, meta, year):
+    """
+    Calculates and prints relaxed precision, recall, and F1 score.
+    A prediction is considered correct if it is within +/- 1 day of a ground truth event.
+    """
+    print(f"\nYear {year} Relaxed Metrics (+/- 1 day):")
+    
+    # 1. Prepare DataFrame for window operations
+    df_eval = meta.copy()
+    df_eval["target"] = y_true.values
+    df_eval["prediction"] = y_pred
+    
+    # Ensure sorted by space then time for correct shifting
+    if not pd.api.types.is_datetime64_any_dtype(df_eval["time"]):
+         df_eval["time"] = pd.to_datetime(df_eval["time"])
+         
+    df_eval = df_eval.sort_values(["latitude", "longitude", "time"])
+    
+    # 2. Define Window Helpers
+    indexer = df_eval.groupby(["latitude", "longitude"])
+    
+    # Relaxed Recall: Did we predict 1 loosely around the actual event?
+    # Expand Predictions: if Pred(t)=1, then Pred_Relaxed(t-1)=1, Pred_Relaxed(t)=1, Pred_Relaxed(t+1)=1.
+    p = df_eval["prediction"]
+    p_prev = indexer["prediction"].shift(1).fillna(0)
+    p_next = indexer["prediction"].shift(-1).fillna(0)
+    pred_relaxed = ((p == 1) | (p_prev == 1) | (p_next == 1)).astype(int)
+    
+    # Relaxed Precision: Was the prediction close to an actual event?
+    # Expand Targets: if Target(t)=1, then Target_Relaxed(t-1)=1, Target_Relaxed(t)=1, Target_Relaxed(t+1)=1.
+    t = df_eval["target"]
+    t_prev = indexer["target"].shift(1).fillna(0)
+    t_next = indexer["target"].shift(-1).fillna(0)
+    target_relaxed = ((t == 1) | (t_prev == 1) | (t_next == 1)).astype(int)
+    
+    # Calculate Metrics
+    # Precision: TP / (TP + FP) where "TP" means Pred=1 & RelaxedTarget=1
+    true_pos_relaxed_prec = ((df_eval["prediction"] == 1) & (target_relaxed == 1)).sum()
+    total_pred_pos = (df_eval["prediction"] == 1).sum()
+    
+    relaxed_precision = true_pos_relaxed_prec / total_pred_pos if total_pred_pos > 0 else 0.0
+    
+    # Recall: TP / (TP + FN) where "TP" means Target=1 & RelaxedPred=1
+    true_pos_relaxed_rec = ((df_eval["target"] == 1) & (pred_relaxed == 1)).sum()
+    total_target_pos = (df_eval["target"] == 1).sum()
+    
+    relaxed_recall = true_pos_relaxed_rec / total_target_pos if total_target_pos > 0 else 0.0
+    
+    # F1
+    if (relaxed_precision + relaxed_recall) > 0:
+        relaxed_f1 = 2 * (relaxed_precision * relaxed_recall) / (relaxed_precision + relaxed_recall)
+    else:
+        relaxed_f1 = 0.0
+        
+    print(f"  Precision (Relaxed): {relaxed_precision:.4f}")
+    print(f"  Recall (Relaxed)   : {relaxed_recall:.4f}")
+    print(f"  F1 Score (Relaxed) : {relaxed_f1:.4f}")
+    print("-" * 30)
+
+
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate trained model on holdout years (New Climate Source)")
-    parser.add_argument("--config", default="configs/config_climate_wind.yaml", help="Path to config YAML")
+    parser.add_argument("--config", default="configs/config_climate_coldwave.yaml", help="Path to config YAML")
     args = parser.parse_args()
 
     config = load_config(args.config)

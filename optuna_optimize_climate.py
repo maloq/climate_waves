@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import warnings
+import gc
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -25,7 +26,7 @@ import pandas as pd
 import xarray as xr
 import yaml
 from catboost import CatBoostClassifier
-from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, precision_recall_curve
 
 # Use new loader
 # apply_label_smoothing and load_config reused from load_data via load_climate_data or directly
@@ -239,8 +240,9 @@ def create_trial_config(
             model_config["bagging_temperature"] = trial.suggest_float("bagging_temperature", 0.0, 2.0)
         else:
             model_config.pop("bagging_temperature", None)
-            
-        model_config["decision_threshold"] = trial.suggest_float("decision_threshold", 0.3, 0.7)
+        
+        # Removed decision_threshold from optimization search space
+        model_config.pop("decision_threshold", None)
         
         use_class_weights = trial.suggest_categorical("use_class_weights", [True, False])
         if use_class_weights:
@@ -252,8 +254,7 @@ def create_trial_config(
             for k, v in fixed_model_params.items():
                 if k not in ["task_type", "devices", "thread_count"]:
                     model_config[k] = v
-            if "decision_threshold" in fixed_model_params:
-                model_config["decision_threshold"] = fixed_model_params["decision_threshold"]
+            # Removed logic to copy decision_threshold
 
     # Enforce conditional parameter logic (cleanup invalid params)
     if model_config.get("bootstrap_type") != "Bayesian":
@@ -265,8 +266,8 @@ def create_trial_config(
     config["model"] = model_config
     
     if mode == "features" and fixed_model_params:
-        if "class_weights_ratio" in fixed_model_params:
-             config["training"]["class_weights"] = [1.0, fixed_model_params["class_weights_ratio"]]
+        if "class_weight_ratio" in fixed_model_params:
+             config["training"]["class_weights"] = [1.0, fixed_model_params["class_weight_ratio"]]
 
     return config
 
@@ -275,20 +276,41 @@ def evaluate_model(
     model: CatBoostClassifier,
     X: pd.DataFrame,
     y: pd.Series,
-    threshold: float = 0.5,
+    threshold: float = None,
     use_soft_labels: bool = False,
 ) -> Dict[str, float]:
     proba = model.predict_proba(X)[:, 1]
-    preds = (proba >= threshold).astype(int)
     y_binary = (y >= 0.5).astype(int) if use_soft_labels else y
     
-    return {
-        "f1": f1_score(y_binary, preds),
-        "precision": precision_score(y_binary, preds, zero_division=0),
-        "recall": recall_score(y_binary, preds, zero_division=0),
-        "roc_auc": roc_auc_score(y_binary, proba) if len(np.unique(y_binary)) > 1 else 0.0,
-    }
-
+    if threshold is None:
+        # Dynamic Threshold Finding for Max F1
+        precision, recall, thresholds = precision_recall_curve(y_binary, proba)
+        f1_scores = 2 * (precision * recall) / (precision + recall + 1e-10)
+        best_idx = np.argmax(f1_scores)
+        best_threshold = thresholds[best_idx]
+        best_f1 = f1_scores[best_idx]
+        threshold = best_threshold # Use best found for other metrics
+        
+        # Recalculate preds with new best threshold
+        preds = (proba >= threshold).astype(int)
+        
+        return {
+            "f1": best_f1,
+            "precision": precision_score(y_binary, preds, zero_division=0),
+            "recall": recall_score(y_binary, preds, zero_division=0),
+            "roc_auc": roc_auc_score(y_binary, proba) if len(np.unique(y_binary)) > 1 else 0.0,
+            "best_threshold": float(best_threshold)
+        }
+    else:
+        # Standard evaluation with fixed threshold
+        preds = (proba >= threshold).astype(int)
+        return {
+            "f1": f1_score(y_binary, preds),
+            "precision": precision_score(y_binary, preds, zero_division=0),
+            "recall": recall_score(y_binary, preds, zero_division=0),
+            "roc_auc": roc_auc_score(y_binary, proba) if len(np.unique(y_binary)) > 1 else 0.0,
+            "threshold": threshold
+        }
 
 
 def generate_super_config(base_config: Dict) -> Dict:
@@ -309,7 +331,6 @@ def generate_super_config(base_config: Dict) -> Dict:
     super_config["label_smoothing"]["enabled"] = False
     
     return super_config
-
 
 
 class OptunaObjective:
@@ -339,7 +360,7 @@ class OptunaObjective:
             
         super_config = generate_super_config(base_config)
         
-        # Load Training Data
+        # Load Training Data (WITH CACHE)
         self.X_train_full, self.y_train_raw, self.meta_train = load_years(
             self.train_years,
             super_config,
@@ -348,10 +369,11 @@ class OptunaObjective:
             return_hard_labels=False, # Raw y is hard because smoothing is disabled
             return_metadata=True,
             apply_label_smoothing_flag=False,
-            align_to_targets=True
+            align_to_targets=True,
+            use_cache=True # Enable caching
         )
         
-        # Load Validation Data
+        # Load Validation Data (WITH CACHE)
         self.X_val_full, self.y_val_raw, self.meta_val = load_years(
             self.val_years,
             super_config,
@@ -360,8 +382,11 @@ class OptunaObjective:
             return_hard_labels=False,
             return_metadata=True,
             apply_label_smoothing_flag=False,
-            align_to_targets=True
+            align_to_targets=True,
+            use_cache=True # Enable caching
         )
+        
+        gc.collect()
         
         if self.verbose:
             print(f"Data loaded. Train shape: {self.X_train_full.shape}, Val shape: {self.X_val_full.shape}")
@@ -391,7 +416,8 @@ class OptunaObjective:
             y_val = self.y_val_raw
             
             model_cfg = config["model"].copy()
-            decision_threshold = model_cfg.pop("decision_threshold", 0.5)
+            # decision_threshold is NO LONGER in model_cfg
+            model_cfg.pop("decision_threshold", None) 
             model_cfg.pop("verbose", None)
             
             # Handle class weights params
@@ -427,14 +453,16 @@ class OptunaObjective:
                 verbose=False,
             )
             
+            # Evaluate with Dynamic Threshold
             metrics = evaluate_model(
                 model, X_val, y_val, 
-                threshold=decision_threshold,
+                threshold=None, # Trigger dynamic finding
                 use_soft_labels=False, 
             )
             
             trial.set_user_attr("val_f1", metrics["f1"])
             trial.set_user_attr("val_roc_auc", metrics["roc_auc"])
+            trial.set_user_attr("best_threshold", metrics.get("best_threshold", 0.5))
             trial.set_user_attr("n_features", len(X_train.columns))
             
             return metrics[self.metric]
@@ -453,10 +481,7 @@ def run_optimization(
 ) -> None:
     base_config = load_config(config_path)
     train_years = base_config["data"]["train_years"]
-    val_years = base_config["data"]["test_years"] # Use test years as val for optimization loop or split train?
-    # Actually better to take last year of train as val, and keep test separate?
-    # Original config had train [2017-2022] and test [2023, 2024].
-    # optuna_optimize.py used 2022 for validation.
+    val_years = base_config["data"]["test_years"] 
     
     # Let's split train_years for optuna:
     # Train: 2017-2021
@@ -492,9 +517,13 @@ def run_optimization(
     
     best_config_stage1 = create_trial_config(best_trial_model, base_config, mode="model")
     best_model_params = best_config_stage1["model"]
+    
+    # Store dynamic threshold if available? 
+    # Actually we just want the model params. Threshold is a post-processing step now.
+    
     if "class_weights" in best_config_stage1["training"] and best_config_stage1["training"]["class_weights"] is not None:
         best_training_params = best_config_stage1["training"]
-        best_model_params["class_weights_ratio"] = best_training_params["class_weights"][1]
+        best_model_params["class_weight_ratio"] = best_training_params["class_weights"][1]
 
     # Stage 2: Features
     print("STAGE 2: FEATURES")
@@ -525,8 +554,8 @@ def run_optimization(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="config_climate.yaml")
-    parser.add_argument("--trials", type=int, default=100)
+    parser.add_argument("--config", default="configs/config_climate_heatwave.yaml")
+    parser.add_argument("--trials", type=int, default=50)
     args = parser.parse_args()
     
     run_optimization(config_path=args.config, n_trials=args.trials)

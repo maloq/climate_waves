@@ -29,7 +29,7 @@ model:
 
 training:
   validation_size: 0.2
-  shuffle: true
+  shuffle: false
 
 output:
   model_path: artifacts/test_subsample/model.cbm

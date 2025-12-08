@@ -5,8 +5,9 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 import pandas as pd
+import numpy as np
 from catboost import CatBoostClassifier
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, average_precision_score
 from sklearn.model_selection import train_test_split
 
 # Use the new data loader
@@ -63,10 +64,26 @@ def train_model(config: Dict) -> None:
     class_weight_ratio = model_cfg.pop("class_weight_ratio", 1.0)
     
     # Check if label smoothing is enabled
+    # Check if label smoothing is enabled
     use_label_smoothing = ls_config.get("enabled", False)
     if use_label_smoothing:
         print("\n[Label Smoothing] Enabled - using CrossEntropy loss for soft targets")
         model_cfg["loss_function"] = "CrossEntropy"
+    elif model_cfg.get("loss_function") == "Focal":
+        # Construct Focal loss string if specific params are given
+        alpha = model_cfg.pop("focal_alpha", None)
+        gamma = model_cfg.pop("focal_gamma", None)
+        
+        if alpha is not None or gamma is not None:
+            focal_str = "Focal:"
+            params = []
+            if alpha is not None: params.append(f"focal_alpha={alpha}")
+            if gamma is not None: params.append(f"focal_gamma={gamma}")
+            focal_str += ";".join(params)
+            model_cfg["loss_function"] = focal_str
+            print(f"\n[Focal Loss] Enabled - using {focal_str}")
+        else:
+            print("\n[Focal Loss] Enabled - using Default Focal Loss")
 
     print(f"\nTrain years: {data_cfg['train_years']}")
     print(f"Output model path: {output_cfg['model_path']}")
@@ -80,6 +97,14 @@ def train_model(config: Dict) -> None:
         apply_label_smoothing_flag=True,
         align_to_targets=True
     )
+    
+    # [Data Leakage Fix] Drop hard target column from features if it leaked there
+    target_var = data_cfg["target_var"]
+    leak_col = f"{target_var}_hard"
+    if leak_col in X.columns:
+        print(f"[Data Leakage] Dropping leaked target column '{leak_col}' from features.")
+        X = X.drop(columns=[leak_col])
+        
     print(f"Data loaded: {len(X):,} samples, {len(X.columns)} features")
 
 
@@ -132,33 +157,107 @@ def train_model(config: Dict) -> None:
     if use_label_smoothing:
         print(f"[Label Smoothing] Label stats: min={y.min():.3f}, max={y.max():.3f}, mean={y.mean():.3f}")
     
-    print("Splitting data into train/validation sets...")
+    print("Splitting data into train/validation sets (Temporal Split)...")
     
-    # Stratified split using metadata
-    # We need to split X, y, y_hard, and meta consistently
-    if use_label_smoothing and y_hard is not None:
-        stratify_labels = y_hard 
-    elif use_label_smoothing:
-        stratify_labels = (y >= 0.5).astype(int)
-    else:
-        stratify_labels = y
+    # Extract years from metadata to perform temporal split
+    # We assume 'time' is available in meta and is a datetime object
+    if "time" not in meta.columns:
+        raise ValueError("Metadata 'time' column required for temporal splitting")
         
-    # Using train_test_split directly here to handle the 4th array (meta) easier than modifying split_data helper
-    # which is getting complicated with all optional args
-    X_train, X_val, y_train, y_val, y_train_hard, y_val_hard, meta_train, meta_val = train_test_split(
-        X, y, y_hard, meta,
-        test_size=train_cfg.get("validation_size", 0.2),
-        random_state=data_cfg.get("random_seed", 42),
-        shuffle=train_cfg.get("shuffle", True),
-        stratify=stratify_labels
-    )
+    # Standardize time column to datetime if needed
+    if not np.issubdtype(meta["time"].dtype, np.datetime64):
+         meta["time"] = pd.to_datetime(meta["time"])
+
+    all_years = sorted(meta["time"].dt.year.unique())
+    if len(all_years) < 2:
+        print(f"Warning: Only {len(all_years)} year(s) found {all_years}. Cannot perform temporal split. Using random split.")
+        # Fallback to random split if only 1 year
+        X_train, X_val, y_train, y_val, y_train_hard, y_val_hard, meta_train, meta_val = train_test_split(
+            X, y, y_hard, meta,
+            test_size=train_cfg.get("validation_size", 0.4),
+            random_state=data_cfg.get("random_seed", 42),
+            shuffle=False,
+            stratify=None
+        )
+    else:
+        # Use the last year for validation
+        val_year = all_years[-1]
+        train_years_list = all_years[:-1]
+        
+        print(f"  Training years: {train_years_list}")
+        print(f"  Validation year: {val_year}")
+        
+        val_mask = meta["time"].dt.year == val_year
+        train_mask = ~val_mask
+        
+        X_train = X[train_mask].copy()
+        X_val = X[val_mask].copy()
+        
+        y_train = y[train_mask].copy()
+        y_val = y[val_mask].copy()
+        
+        if y_hard is not None:
+            y_train_hard = y_hard[train_mask].copy()
+            y_val_hard = y_hard[val_mask].copy()
+        else:
+            y_train_hard = None
+            y_val_hard = None
+            
+        meta_train = meta[train_mask].copy()
+        meta_val = meta[val_mask].copy()
+        
+        # --- Undersampling Training Data (10:1 Negative:Positive) ---
+        print("\n[Undersampling] Balancing training data...")
+        # Identify positive indices
+        # Use y_train_hard if available, else threshold y_train
+        if y_train_hard is not None:
+            pos_mask_train = y_train_hard == 1
+        else:
+            pos_mask_train = y_train >= 0.5
+            
+        pos_indices = np.where(pos_mask_train)[0]
+        neg_indices = np.where(~pos_mask_train)[0]
+        
+        n_pos = len(pos_indices)
+        n_neg = len(neg_indices)
+        target_neg = n_pos * 50
+        
+        print(f"  Original Train Counts: Pos={n_pos:,}, Neg={n_neg:,}")
+        
+        if n_neg > target_neg:
+            print(f"  Undersampling Negatives to {target_neg:,} (50:1 ratio)")
+            # Randomly sample negative indices
+            # Set seed for reproducibility
+            np.random.seed(data_cfg.get("random_seed", 42))
+            undersampled_neg_indices = np.random.choice(neg_indices, size=target_neg, replace=False)
+            
+            # Combine and shuffle
+            keep_indices = np.concatenate([pos_indices, undersampled_neg_indices])
+            np.random.shuffle(keep_indices)
+            
+            # Apply to all training arrays
+            # Note: X_train is a DataFrame, y_train Series. iloc is safest.
+            X_train = X_train.iloc[keep_indices]
+            y_train = y_train.iloc[keep_indices]
+            
+            if y_train_hard is not None:
+                y_train_hard = y_train_hard.iloc[keep_indices]
+                
+            meta_train = meta_train.iloc[keep_indices]
+            print(f"  New Train Size: {len(X_train):,}")
+        else:
+            print("  Negatives count below target ratio, skipping undersampling.")
+        # ------------------------------------------------------------
 
     class_weights = train_cfg.get("class_weights")
     if class_weights is not None:
         model_cfg["class_weights"] = class_weights
     elif use_class_weights:
-        print(f"[Class Weights] Enabled - using scale_pos_weight={class_weight_ratio}")
-        model_cfg["scale_pos_weight"] = class_weight_ratio
+        if model_cfg.get("loss_function") == "CrossEntropy":
+            print(f"[Class Weights] CrossEntropy active: scale_pos_weight is not supported. Will use sample_weight during fit instead.")
+        else:
+            print(f"[Class Weights] Enabled - using scale_pos_weight={class_weight_ratio}")
+            model_cfg["scale_pos_weight"] = class_weight_ratio
 
     print("\n" + "=" * 60)
     print("TRAINING CONFIGURATION")
@@ -175,18 +274,76 @@ def train_model(config: Dict) -> None:
     model = CatBoostClassifier(**model_cfg)
     print("Starting training...\n")
     
-    model.fit(X_train, y_train, eval_set=(X_val, y_val_hard), verbose=verbose)
+    # Prepare sample weights if needed (for CrossEntropy with class weights)
+    train_sample_weight = None
+    if use_class_weights and model_cfg.get("loss_function") == "CrossEntropy":
+        print(f"Creating sample weights with positive weight {class_weight_ratio}...")
+        # Use hard labels for weighting to simulate scale_pos_weight
+        if y_train_hard is not None:
+             ref_labels = y_train_hard
+        else:
+             ref_labels = (y_train >= 0.5).astype(int)
+        
+        train_sample_weight = np.ones(len(y_train), dtype=np.float32)
+        train_sample_weight[ref_labels == 1] = class_weight_ratio
 
-    # Training metrics
+    model.fit(X_train, y_train, sample_weight=train_sample_weight, eval_set=(X_val, y_val_hard), verbose=verbose)
+
+    # --- Threshold Tuning ---
+    print("\nFinding optimal decision threshold on validation set...")
+    val_proba = model.predict_proba(X_val)[:, 1]
+
+    # Calculate PR AUC (Average Precision)
+    # We use y_true_tuning which is either hard labels or binarized soft labels
+    y_true_tuning = (y_val_hard if y_val_hard is not None else (y_val >= 0.5)).astype(int)
+    pr_auc = average_precision_score(y_true_tuning, val_proba)
+    print(f"PR AUC (Average Precision): {pr_auc:.4f}")
+
+
+    
+    
+    # thresholds = np.arange(0.05, 0.96, 0.05)
+    # best_threshold = 0.5
+    # best_f1 = -1.0
+    # best_report = ""
+    
+    # # We need true labels for tuning
+    # # If y_val_hard is None (soft labels only, rare), we must threshold y_val
+    # # y_true_tuning defined above
+
+    thresholds = np.arange(0.05, 0.96, 0.05)
+    best_threshold = 0.5
+    best_f1 = -1.0
+    best_report = ""
+
+    for thresh in thresholds:
+        preds = (val_proba >= thresh).astype(int)
+        report_dict = classification_report(y_true_tuning, preds, output_dict=True, zero_division=0)
+        # Use macro avg F1 or positive class F1? Usually positive class F1 is what we care about in imbalance
+        # "1" is the positive class
+        f1 = report_dict.get("1", {}).get("f1-score", 0.0)
+        
+
+        
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = thresh
+            best_report = classification_report(y_true_tuning, preds, zero_division=0)
+
+    print(f"Optimal Threshold: {best_threshold:.2f} (F1={best_f1:.4f})")
+    print(f"Default Threshold (0.5) F1: {classification_report(y_true_tuning, (val_proba >= 0.5).astype(int), output_dict=True, zero_division=0).get('1', {}).get('f1-score', 0.0):.4f}")
+    
+    # Use optimal threshold for final outputs
+    decision_threshold = best_threshold
+    val_pred = (val_proba >= decision_threshold).astype(int)
+    val_report = best_report
+    
+    # Re-calc train report with new threshold for consistency
     train_proba = model.predict_proba(X_train)[:, 1]
     train_pred = (train_proba >= decision_threshold).astype(int)
-    train_report = classification_report(y_train_hard, train_pred)
-
-    # Validation metrics
-    val_proba = model.predict_proba(X_val)[:, 1]
-    val_pred = (val_proba >= decision_threshold).astype(int)
-    val_report = classification_report(y_val_hard, val_pred)
-
+    train_report = classification_report(y_train_hard, train_pred, zero_division=0)
+    
+    # --- Save Model & Report ---
     model_path = Path(output_cfg["model_path"])
     model_path.parent.mkdir(parents=True, exist_ok=True)
     model.save_model(model_path)
@@ -195,16 +352,19 @@ def train_model(config: Dict) -> None:
     with report_path.open("w") as f:
         f.write("Training classification report\n")
         f.write(f"Decision threshold: {decision_threshold}\n")
+        f.write(f"PR AUC: {pr_auc:.4f}\n")
         f.write("\n")
         f.write(train_report)
         f.write("\n" + "=" * 60 + "\n\n")
         f.write("Validation classification report\n")
-        f.write(f"Decision threshold: {decision_threshold}\n\n")
+        f.write(f"Decision threshold: {decision_threshold}\n")
+        f.write(f"PR AUC: {pr_auc:.4f}\n\n")
         f.write(val_report)
+    # ---------------------------
 
-    print("\nTraining metrics:")
+    print("\nTraining metrics (at optimal threshold):")
     print(train_report)
-    print("\nValidation metrics:")
+    print("\nValidation metrics (at optimal threshold):")
     print(val_report)
     print(f"\nSaved model to {model_path}")
 
@@ -248,7 +408,7 @@ def main() -> None:
     print("=" * 60)
 
     parser = argparse.ArgumentParser(description="Train CatBoost event model with new data")
-    parser.add_argument("--config", default="configs/config_climate_heatwave.yaml", help="Path to config YAML")
+    parser.add_argument("--config", default="configs/config_climate_coldwave.yaml", help="Path to config YAML")
     args = parser.parse_args()
 
     print(f"Loading config from: {args.config}")
