@@ -1,27 +1,27 @@
 Training classification report
-Decision threshold: 0.55
-PR AUC: 0.2518
+Decision threshold: 0.5
+PR AUC: 0.2987
 
               precision    recall  f1-score   support
 
-           0       0.97      0.98      0.97   4986473
-           1       0.47      0.36      0.41    262285
+           0       0.98      0.95      0.96   3994034
+           1       0.32      0.51      0.39    187428
 
-    accuracy                           0.95   5248758
-   macro avg       0.72      0.67      0.69   5248758
-weighted avg       0.94      0.95      0.94   5248758
+    accuracy                           0.93   4181462
+   macro avg       0.65      0.73      0.68   4181462
+weighted avg       0.95      0.93      0.94   4181462
 
 ============================================================
 
 Validation classification report
-Decision threshold: 0.55
-PR AUC: 0.2518
+Decision threshold: 0.5
+PR AUC: 0.2987
 
               precision    recall  f1-score   support
 
-           0       0.96      0.98      0.97   1012866
-           1       0.43      0.21      0.29     54430
+           0       0.96      0.95      0.95   2005305
+           1       0.32      0.36      0.34    129287
 
-    accuracy                           0.95   1067296
-   macro avg       0.69      0.60      0.63   1067296
-weighted avg       0.93      0.95      0.94   1067296
+    accuracy                           0.92   2134592
+   macro avg       0.64      0.66      0.65   2134592
+weighted avg       0.92      0.92      0.92   2134592

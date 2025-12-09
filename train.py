@@ -7,45 +7,9 @@ from typing import Dict, Tuple
 import pandas as pd
 from catboost import CatBoostClassifier
 from sklearn.metrics import classification_report
-from sklearn.model_selection import train_test_split
+import numpy as np
 
 from load_data import load_config, load_years
-
-
-def split_data(
-    X: pd.DataFrame, y: pd.Series, validation_size: float, random_seed: int,
-    y_hard: pd.Series | None = None,
-    use_soft_labels: bool = False,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series] | Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series, pd.Series]:
-    # For soft labels, stratify on binarized labels (>=0.5 threshold)
-    # For hard labels, stratify directly on y
-
-    if use_soft_labels and y_hard is not None:
-            stratify_labels = y_hard # Best to stratify on real hard labels if available
-    elif use_soft_labels:
-        stratify_labels = (y >= 0.5).astype(int)
-    else:
-        stratify_labels = y
-
-    
-    if y_hard is not None:
-        X_train, X_val, y_train, y_val, y_train_hard, y_val_hard = train_test_split(
-            X,
-            y,
-            y_hard,
-            test_size=validation_size,
-            random_state=random_seed,
-            shuffle=False,
-        )
-        return X_train, X_val, y_train, y_val, y_train_hard, y_val_hard
-    
-    return train_test_split(
-        X,
-        y,
-        test_size=validation_size,
-        random_state=random_seed,
-        shuffle=False,
-    )
 
 
 def train_model(config: Dict) -> None:
@@ -71,23 +35,66 @@ def train_model(config: Dict) -> None:
     print(f"Output model path: {output_cfg['model_path']}")
     print("\nLoading training data...")
     # Load hard labels too if using soft labels (or always, for consistent validation)
-    X, y, y_hard = load_years(data_cfg["train_years"], config=config, return_hard_labels=True)
+    X, y, meta, y_hard = load_years(
+        data_cfg["train_years"], 
+        config=config, 
+        return_hard_labels=True,
+        return_metadata=True
+    )
     print(f"Data loaded: {len(X):,} samples, {len(X.columns)} features")
     
     if use_label_smoothing:
         print(f"[Label Smoothing] Label stats: min={y.min():.3f}, max={y.max():.3f}, mean={y.mean():.3f}")
     
-    print("Splitting data into train/validation sets...")
+    print("Splitting data into train/validation sets (Temporal Split)...")
     
-    # Split both y (potentially soft) and y_hard
-    X_train, X_val, y_train, y_val, y_train_hard, y_val_hard = split_data(
-        X=X,
-        y=y,
-        validation_size=train_cfg.get("validation_size", 0.2),
-        random_seed=data_cfg.get("random_seed", 42),
-        y_hard=y_hard,
-        use_soft_labels=use_label_smoothing,
-    )
+    if "time" not in meta.columns:
+        raise ValueError("Metadata 'time' column required for temporal splitting")
+        
+    # Standardize time column to datetime if needed
+    if not np.issubdtype(meta["time"].dtype, np.datetime64):
+        meta["time"] = pd.to_datetime(meta["time"])
+
+    meta_time = meta["time"]
+    all_years = sorted(meta_time.dt.year.unique())
+
+    if len(all_years) < 2:
+        raise ValueError(f"Need at least 2 distinct years for temporal split, found {len(all_years)}: {all_years}")
+
+    # Derive number of full years to allocate to validation (no partial years)
+    val_size_cfg = train_cfg.get("validation_size", 0.2)
+    if isinstance(val_size_cfg, float) and val_size_cfg < 1.0:
+        val_year_count = max(1, int(np.ceil(len(all_years) * val_size_cfg)))
+    else:
+        val_year_count = int(val_size_cfg) if val_size_cfg is not None else 1
+
+    # Ensure at least one training year remains
+    if val_year_count >= len(all_years):
+        val_year_count = len(all_years) - 1
+    if val_year_count < 1:
+        raise ValueError("validation_size leads to empty validation set; provide >=2 years or adjust validation_size.")
+
+    val_years = all_years[-val_year_count:]
+    train_years_list = all_years[:-val_year_count]
+    
+    print(f"  Training years: {train_years_list}")
+    print(f"  Validation years: {val_years}")
+    
+    val_mask = meta_time.dt.year.isin(val_years)
+    train_mask = meta_time.dt.year.isin(train_years_list)
+    
+    X_train = X[train_mask].copy()
+    X_val = X[val_mask].copy()
+    
+    y_train = y[train_mask].copy()
+    y_val = y[val_mask].copy()
+    
+    if y_hard is not None:
+        y_train_hard = y_hard[train_mask].copy()
+        y_val_hard = y_hard[val_mask].copy()
+    else:
+        y_train_hard = None
+        y_val_hard = None
 
     class_weights = train_cfg.get("class_weights")
     if class_weights is not None:

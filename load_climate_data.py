@@ -375,7 +375,6 @@ def load_years(
         
         # Load Zarr
         if zarr_vars:
-            # Revert to old valid load_zarr_dataset call if I don't change that function
             ds_zarr = load_zarr_dataset(
                 data_cfg["features_dir"], zarr_vars, lat_range, lon_range
             )

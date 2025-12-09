@@ -16,9 +16,16 @@ features:
 - t2m
 - d2m
 - tp
-- stl1
 - u10
 - v10
+- geopotential_h00_lvl850
+- geopotential_h00_lvl1000
+- u_component_of_wind_h00_lvl850
+- u_component_of_wind_h00_lvl1000
+- temperature_h00_lvl850
+- temperature_h00_lvl1000
+- v_component_of_wind_h00_lvl850
+- v_component_of_wind_h00_lvl1000
 
 # Feature engineering configuration
 feature_engineering:
@@ -35,22 +42,31 @@ feature_engineering:
   lag:
     variables:
       - t2m
-      - d2m
-      - stl1
       - u10
       - v10
       - tp
+      - geopotential_h00_lvl850
+      - u_component_of_wind_h00_lvl850
+      - temperature_h00_lvl850
+      - v_component_of_wind_h00_lvl850
     lags: [1, 3, 7]
 
   # EWM
   ewm:
     variables:
       - t2m
-      - stl1
       - tp
       - d2m
       - u10
       - v10
+      - geopotential_h00_lvl850
+      - u_component_of_wind_h00_lvl850
+      - temperature_h00_lvl850
+      - v_component_of_wind_h00_lvl850
+      - geopotential_h00_lvl1000
+      - u_component_of_wind_h00_lvl1000
+      - temperature_h00_lvl1000
+      - v_component_of_wind_h00_lvl1000
     spans: [3, 7, 14, 30]
 
   # Spatial stats
@@ -61,6 +77,14 @@ feature_engineering:
       - tp
       - u10
       - v10
+      - geopotential_h00_lvl850
+      - u_component_of_wind_h00_lvl850
+      - temperature_h00_lvl850
+      - v_component_of_wind_h00_lvl850
+      - geopotential_h00_lvl1000
+      - u_component_of_wind_h00_lvl1000
+      - temperature_h00_lvl1000
+      - v_component_of_wind_h00_lvl1000
     window_sizes: [5, 11]
     stats: [mean, std]
 
@@ -70,9 +94,16 @@ feature_engineering:
       - t2m
       - d2m
       - tp
-      - stl1
       - u10
       - v10
+      - geopotential_h00_lvl850
+      - u_component_of_wind_h00_lvl850
+      - temperature_h00_lvl850
+      - v_component_of_wind_h00_lvl850
+      - geopotential_h00_lvl1000
+      - u_component_of_wind_h00_lvl1000
+      - temperature_h00_lvl1000
+      - v_component_of_wind_h00_lvl1000
 
   # Temporal diff
   temporal_diff:
@@ -80,13 +111,46 @@ feature_engineering:
       - t2m
       - d2m
       - tp
-      - stl1
       - u10
       - v10
+      - geopotential_h00_lvl850
+      - u_component_of_wind_h00_lvl850
+      - temperature_h00_lvl850
+      - v_component_of_wind_h00_lvl850
+      - geopotential_h00_lvl1000
+      - u_component_of_wind_h00_lvl1000
+      - temperature_h00_lvl1000
+      - v_component_of_wind_h00_lvl1000
     periods: [1, 3, 7, 14, 30]
 
+    climatology:
+    variables:
+      - temperature_h00_lvl1000
+      - temperature_h00_lvl850
+    path: climate_data/climatology.nc
+
+  wind_chill:
+    enabled: true
+    temp_var: temperature_h00_lvl1000
+    u_var: u_component_of_wind_h00_lvl1000
+    v_var: v_component_of_wind_h00_lvl1000
+
+  advection:
+    enabled: true
+    temp_var: temperature_h00_lvl1000
+    u_var: u_component_of_wind_h00_lvl1000
+    v_var: v_component_of_wind_h00_lvl1000
+
+
+  regional:
+    variables:
+      - temperature_h00_lvl1000
+      - geopotential_h00_lvl1000
+    stats: [mean, std, min, max]
+
+
 label_smoothing:
-  enabled: false
+  enabled: true
   temporal_sigma: 1.5
   temporal_radius: 3
   spatial_sigma: 1.0
@@ -95,22 +159,24 @@ label_smoothing:
   min_smooth_value: 0.0
 
 model:
-  iterations: 400
-  learning_rate: 0.03
+  iterations: 50
+  l2_leaf_reg: 5
+  learning_rate: 0.01
+  depth: 8
+  learning_rate: 0.01
   depth: 8
   loss_function: Logloss
   eval_metric: F1
-  l2_leaf_reg: 4.7
   random_seed: 42
-  task_type: GPU
-  decision_threshold: 0.5
+  task_type: CPU
+  # decision_threshold: 0.5
   verbose: 10
-  bootstrap_type: Bayesian
-  bagging_temperature: 1.14
+  # bootstrap_type: Bayesian
+  # bagging_temperature: 1.14
   use_class_weights: true
   class_weight_ratio: 6.14
-  grow_policy: SymmetricTree
-  min_data_in_leaf: 77
+  # grow_policy: SymmetricTree
+  # min_data_in_leaf: 77
 
 training:
   validation_size: 0.2
