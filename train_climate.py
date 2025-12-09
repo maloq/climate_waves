@@ -375,7 +375,7 @@ def main() -> None:
     print("=" * 60)
 
     parser = argparse.ArgumentParser(description="Train CatBoost event model with new data")
-    parser.add_argument("--config", default="configs/config_climate_wind.yaml", help="Path to config YAML")
+    parser.add_argument("--config", default="configs/config_climate_coldwave_local.yaml", help="Path to config YAML")
     args = parser.parse_args()
 
     print(f"Loading config from: {args.config}")

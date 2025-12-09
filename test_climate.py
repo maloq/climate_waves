@@ -150,7 +150,7 @@ def calculate_relaxed_metrics(y_true, y_pred, y_proba, meta, year):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate trained model on holdout years (New Climate Source)")
-    parser.add_argument("--config", default="configs/config_climate_coldwave.yaml", help="Path to config YAML")
+    parser.add_argument("--config", default="configs/config_climate_coldwave_local.yaml", help="Path to config YAML")
     args = parser.parse_args()
 
     config = load_config(args.config)

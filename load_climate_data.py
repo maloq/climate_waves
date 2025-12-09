@@ -19,7 +19,7 @@ from load_data import _subset_region, apply_label_smoothing, load_config
 from feature_engineering import engineer_features
 
 CACHE_DIR = pathlib.Path("cache/climate_data")
-CACHE_LIMIT_GB = 30
+CACHE_LIMIT_GB = 130
 
 def get_config_hash(config: Dict, years: List[int]) -> str:
     """Generates a stable hash for the data configuration + specific years."""
