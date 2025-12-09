@@ -6,7 +6,7 @@ data:
   target_var: extemp_minus
   latitude_range: [40.0, 60.0]
   longitude_range: [30.0, 120.0]
-  train_years: [2017, 2018, 2019, 2020, 2021, 2022]
+  train_years: [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022]
   test_years: [2022, 2023, 2024]
   sample_fraction: 0.1
   random_seed: 42
@@ -159,7 +159,7 @@ label_smoothing:
   min_smooth_value: 0.0
 
 model:
-  iterations: 50
+  iterations: 1000
   l2_leaf_reg: 5
   learning_rate: 0.01
   depth: 8
@@ -168,7 +168,7 @@ model:
   loss_function: Logloss
   eval_metric: F1
   random_seed: 42
-  task_type: CPU
+  task_type: GPU
   # decision_threshold: 0.5
   verbose: 10
   # bootstrap_type: Bayesian

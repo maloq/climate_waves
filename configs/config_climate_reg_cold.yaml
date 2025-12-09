@@ -1,0 +1,124 @@
+data:
+  features_dir: climate_data/ECMWF
+  feature_file_template: "{variable}/{variable}_*.zarr"
+  target_dir: climate_data/target_reg/cold_waves
+  target_file_template: "target_temperature_p05_{year}.nc"
+  target_var: target_temperature_p05
+  latitude_range: [40.0, 60.0]
+  longitude_range: [30.0, 120.0]
+  train_years: [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022]
+  test_years: [2022, 2023, 2024]
+  sample_fraction: 0.1
+  random_seed: 42
+  interpolate: false
+
+features:
+- t2m
+- d2m
+- tp
+- u10
+- v10
+
+feature_engineering:
+  enabled: true
+  
+  temporal:
+    month: true
+    day_of_year: true
+    sin_cos_annual: true
+    sin_cos_semiannual: false
+  
+  lag:
+    variables:
+      - t2m
+      - u10
+      - v10
+      - tp
+    lags: [1, 3, 7]
+
+  ewm:
+    variables:
+      - t2m
+      - tp
+      - d2m
+      - u10
+      - v10
+    spans: [3, 7, 14, 30]
+
+  spatial:
+    variables:
+      - t2m
+      - d2m
+      - tp
+      - u10
+      - v10
+    window_sizes: [5, 11]
+    stats: [mean, std]
+
+  gradients:
+    variables:
+      - t2m
+      - d2m
+      - tp
+      - u10
+      - v10
+
+  temporal_diff:
+    variables:
+      - t2m
+      - d2m
+      - tp
+      - u10
+      - v10
+    periods: [1, 3, 7, 14, 30]
+
+    climatology:
+      variables:
+        - t2m
+      path: climate_data/climatology.nc
+
+  wind_chill:
+    enabled: true
+    temp_var: t2m
+    u_var: u10
+    v_var: v10
+
+  advection:
+    enabled: true
+    temp_var: t2m
+    u_var: u10
+    v_var: v10
+
+  regional:
+    variables:
+      - t2m
+      - u10
+      - v10
+    stats: [mean, std, min, max]
+
+model:
+  iterations: 1000
+  learning_rate: 0.05
+  depth: 8
+  loss_function: RMSE
+  eval_metric: RMSE
+  random_seed: 42
+  task_type: GPU
+  verbose: 10
+  # No class weights for regression
+
+training:
+  validation_size: 0.2
+  shuffle: false
+
+output:
+  model_path: artifacts/coldwave_reg/coldwave_reg_catboost.cbm
+  predictions_dir: artifacts/coldwave_reg/predictions
+
+binarization:
+  enabled: true
+  threshold_file: "climate_data/target_reg/daily_average_cold.nc"
+  threshold_val: 10.0
+  operator: "less" # target < avg - 10
+  ground_truth_file_template: "target_binary_p05_{year}.nc"
+  ground_truth_var: "target_binary_p05"

@@ -1,0 +1,10 @@
+Training Regression Report
+
+Regression Metrics:
+Train RMSE: 3.9764
+Val RMSE:   4.4273
+Val MAE:    3.3312
+Val R2:     0.9109
+
+============================================================
+
