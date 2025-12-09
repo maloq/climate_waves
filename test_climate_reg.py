@@ -158,6 +158,8 @@ def test_model(config: Dict) -> None:
     all_y_true_bin = []
     all_y_pred_bin = []
     
+    table_results = []
+    
     # Process year by year to manage memory, similar to load_years internal but we use load_years helper
     # Actually load_years loads all. For test, we might want to loop manually if memory is tight, 
     # but let's stick to standard `load_years` for consistency with training unless test set is huge.
@@ -230,8 +232,33 @@ def test_model(config: Dict) -> None:
                 # Per-year stats
                 yr_f1 = classification_report(binary_truth, binary_preds, output_dict=True, zero_division=0).get("1", {}).get("f1-score", 0)
                 print(f"  Year {year} F1: {yr_f1:.4f} (Positives: {np.sum(binary_preds)} pred / {np.sum(binary_truth)} true)")
+                
+                table_results.append({
+                    "Year": str(year),
+                    "RMSE": np.sqrt(mean_squared_error(y, preds)),
+                    "MAE": mean_absolute_error(y, preds),
+                    "R2": r2_score(y, preds),
+                    "F1_Binary": yr_f1
+                })
             else:
                 print(f"  Skipping classification metrics for {year} (No ground truth).")
+                # Add row without F1
+                table_results.append({
+                    "Year": str(year),
+                    "RMSE": np.sqrt(mean_squared_error(y, preds)),
+                    "MAE": mean_absolute_error(y, preds),
+                    "R2": r2_score(y, preds),
+                    "F1_Binary": np.nan
+                })
+        else:
+             # No binarization config
+             table_results.append({
+                "Year": str(year),
+                "RMSE": np.sqrt(mean_squared_error(y, preds)),
+                "MAE": mean_absolute_error(y, preds),
+                "R2": r2_score(y, preds),
+                "F1_Binary": np.nan
+            })
 
     # Final Metrics
     print("\n" + "="*60)
@@ -253,6 +280,41 @@ def test_model(config: Dict) -> None:
         print(report)
     
     print("="*60)
+    
+    # --- Print Aggregated Table ---
+    if all_y_true_reg:
+        # Calculate GLOBAL metrics for the "ALL" row
+        rmse_global = np.sqrt(mean_squared_error(all_y_true_reg, all_y_pred_reg))
+        mae_global = mean_absolute_error(all_y_true_reg, all_y_pred_reg)
+        r2_global = r2_score(all_y_true_reg, all_y_pred_reg)
+        
+        f1_global = np.nan
+        if all_y_true_bin:
+            f1_global = classification_report(all_y_true_bin, all_y_pred_bin, output_dict=True, zero_division=0).get("1", {}).get("f1-score", 0)
+            
+        table_results.append({
+            "Year": "ALL",
+            "RMSE": rmse_global,
+            "MAE": mae_global,
+            "R2": r2_global,
+            "F1_Binary": f1_global
+        })
+        
+        print("\n" + "="*80)
+        print("AGGREGATED RESULTS TABLE")
+        print("="*80)
+        df_results = pd.DataFrame(table_results)
+        
+        # Format
+        format_cols = ["RMSE", "MAE", "R2"]
+        for col in format_cols:
+            df_results[col] = df_results[col].apply(lambda x: f"{x:.4f}")
+            
+        if "F1_Binary" in df_results.columns:
+             df_results["F1_Binary"] = df_results["F1_Binary"].apply(lambda x: f"{x:.4f}" if pd.notnull(x) else "-")
+             
+        print(df_results.to_string(index=False))
+        print("="*80 + "\n")
 
 def main() -> None:
     print("TESTING CLIMATE REGRESSION")

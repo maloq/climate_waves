@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
+import numpy as np
 
 import pandas as pd
 from catboost import CatBoostClassifier
@@ -15,7 +16,7 @@ from visualization import plot_monthly_maps
 
 def evaluate_year(
     year: int, model: CatBoostClassifier, config: Dict, threshold: float, pred_dir: Path
-) -> None:
+) -> Tuple[pd.Series, np.ndarray, np.ndarray, pd.DataFrame, Dict, Dict]:
     # Use new loader
     X, y, meta = load_years(
         years=[year],
@@ -69,7 +70,8 @@ def evaluate_year(
     print(report)
     
     # Calculate and print relaxed metrics
-    calculate_relaxed_metrics(y, preds, proba, meta, year)
+    # Calculate and print relaxed metrics
+    # calculate_relaxed_metrics(y, preds, proba, meta, year) # Called later now to capture return
 
     out = meta.copy()
     out["probability"] = proba
@@ -84,6 +86,25 @@ def evaluate_year(
     # Generate Monthly Maps
     print(f"Generating monthly maps for {year}...")
     plot_monthly_maps(meta, y, proba, preds, year, pred_dir)
+
+    # Return data for aggregation
+    # Standard metrics
+    std_rep = classification_report(y, preds, output_dict=True, zero_division=0)
+    std_metrics = {
+        "precision": std_rep["1"]["precision"],
+        "recall": std_rep["1"]["recall"],
+        "f1": std_rep["1"]["f1-score"]
+    }
+    
+    # Relaxed metrics
+    rel_prec, rel_rec, rel_f1 = calculate_relaxed_metrics(y, preds, proba, meta, year)
+    rel_metrics = {
+        "rel_precision": rel_prec,
+        "rel_recall": rel_rec,
+        "rel_f1": rel_f1
+    }
+    
+    return y, preds, proba, meta, std_metrics, rel_metrics
 
 
 def calculate_relaxed_metrics(y_true, y_pred, y_proba, meta, year):
@@ -144,6 +165,8 @@ def calculate_relaxed_metrics(y_true, y_pred, y_proba, meta, year):
     print(f"  Recall (Relaxed)   : {relaxed_recall:.4f}")
     print(f"  F1 Score (Relaxed) : {relaxed_f1:.4f}")
     print("-" * 30)
+    
+    return relaxed_precision, relaxed_recall, relaxed_f1
 
 
 
@@ -183,14 +206,86 @@ def main() -> None:
     model = CatBoostClassifier()
     model.load_model(model_path)
 
+    all_results = []
+    
+    # Accumulate for global relaxed
+    all_meta_list = []
+    all_y_list = []
+    all_preds_list = []
+    all_proba_list = []
+
     for year in config["data"]["test_years"]:
-        evaluate_year(
+        y, preds, proba, meta, std_m, rel_m = evaluate_year(
             year=year,
             model=model,
             config=config,
             threshold=threshold,
             pred_dir=pred_dir,
         )
+        
+        # Store per-year row
+        row = {
+            "Year": str(year),
+            "Precision": std_m["precision"],
+            "Recall": std_m["recall"],
+            "F1": std_m["f1"],
+            "Rel_Precision": rel_m["rel_precision"],
+            "Rel_Recall": rel_m["rel_recall"],
+            "Rel_F1": rel_m["rel_f1"]
+        }
+        all_results.append(row)
+        
+        all_meta_list.append(meta)
+        all_y_list.append(y)
+        all_preds_list.append(preds)
+        all_proba_list.append(proba)
+
+    # --- Calculate Aggregated Metrics ---
+    if all_y_list:
+        # 1. Standard Aggregated
+        full_y = pd.concat(all_y_list)
+        full_preds = np.concatenate(all_preds_list)
+        
+        full_rep = classification_report(full_y, full_preds, output_dict=True, zero_division=0)
+        
+        # 2. Relaxed Aggregated
+        # We need to stitch meta carefully or just reuse the logic.
+        # Relaxed metrics depend on temporal adjacency. Concatenating years might break continuity 
+        # at boundaries, but since they are separate years, that's expected.
+        # We can pass the concatenated dfs to calculate_relaxed_metrics, 
+        # assuming it handles the gaps via the groupby(['latitude', 'longitude']) 
+        # and time sorting. It should just see a jump in time and not match +/- 1 day across year gap.
+        
+        full_meta = pd.concat(all_meta_list)
+        full_proba = np.concatenate(all_proba_list)
+        
+        # Suppress prints for the aggregated calc
+        print("\nCalculating Aggregated Relaxed Metrics...")
+        rel_prec, rel_rec, rel_f1 = calculate_relaxed_metrics(full_y, full_preds, full_proba, full_meta, "ALL_YEARS")
+        
+        agg_row = {
+            "Year": "ALL",
+            "Precision": full_rep["1"]["precision"],
+            "Recall": full_rep["1"]["recall"],
+            "F1": full_rep["1"]["f1-score"],
+            "Rel_Precision": rel_prec,
+            "Rel_Recall": rel_rec,
+            "Rel_F1": rel_f1
+        }
+        all_results.append(agg_row)
+
+    # --- Print Table ---
+    print("\n" + "="*80)
+    print("AGGREGATED RESULTS TABLE")
+    print("="*80)
+    df_results = pd.DataFrame(all_results)
+    # Format floats
+    format_cols = ["Precision", "Recall", "F1", "Rel_Precision", "Rel_Recall", "Rel_F1"]
+    for col in format_cols:
+        df_results[col] = df_results[col].apply(lambda x: f"{x:.4f}")
+        
+    print(df_results.to_string(index=False))
+    print("="*80 + "\n")
 
 
 if __name__ == "__main__":
