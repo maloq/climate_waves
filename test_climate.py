@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import numpy as np
 
 import pandas as pd
@@ -12,6 +12,100 @@ from sklearn.metrics import classification_report
 from load_climate_data import load_config, load_years
 from prepare_land import prepare_land_data, landsea_distance
 from visualization import plot_monthly_maps
+
+
+def load_regression_predictions(
+    pred_dir: str,
+    meta: pd.DataFrame,
+    verbose: bool = True
+) -> Optional[np.ndarray]:
+    """
+    Load regression predictions and map them to the given metadata.
+    
+    Looks for predictions in pred_dir/reg_predictions_<year>.parquet files.
+    Maps predictions to meta by matching time, latitude, longitude.
+    
+    Args:
+        pred_dir: Directory containing regression prediction files
+        meta: DataFrame with 'time', 'latitude', 'longitude' columns
+        verbose: Print progress
+        
+    Returns:
+        Array of regression predictions aligned to meta, or None if not found
+    """
+    pred_path = Path(pred_dir)
+    
+    if not pred_path.exists():
+        if verbose:
+            print(f"  [Reg Predictions] Directory not found: {pred_dir}")
+        return None
+    
+    # Get unique years from meta
+    meta_time = pd.to_datetime(meta["time"])
+    years = meta_time.dt.year.unique()
+    
+    if verbose:
+        print(f"  [Reg Predictions] Loading predictions for years: {sorted(years)}")
+    
+    # Load predictions for each year
+    pred_dfs = []
+    for year in sorted(years):
+        year_file = pred_path / f"reg_predictions_{year}.parquet"
+        if year_file.exists():
+            df = pd.read_parquet(year_file)
+            pred_dfs.append(df)
+            if verbose:
+                print(f"    Loaded {len(df):,} predictions from {year_file.name}")
+        else:
+            if verbose:
+                print(f"    [Warning] Missing predictions file: {year_file}")
+    
+    if not pred_dfs:
+        if verbose:
+            print(f"  [Reg Predictions] No prediction files found")
+        return None
+    
+    # Combine all predictions
+    preds_df = pd.concat(pred_dfs, ignore_index=True)
+    preds_df["time"] = pd.to_datetime(preds_df["time"])
+    
+    # Create lookup key for efficient joining
+    # Round lat/lon to handle floating point comparison
+    preds_df["lat_key"] = (preds_df["latitude"] * 100).round().astype(int)
+    preds_df["lon_key"] = (preds_df["longitude"] * 100).round().astype(int)
+    preds_df["date_key"] = preds_df["time"].dt.date
+    
+    # Create same keys for meta
+    meta_lookup = meta.copy()
+    meta_lookup["time"] = pd.to_datetime(meta_lookup["time"])
+    meta_lookup["lat_key"] = (meta_lookup["latitude"] * 100).round().astype(int)
+    meta_lookup["lon_key"] = (meta_lookup["longitude"] * 100).round().astype(int)
+    meta_lookup["date_key"] = meta_lookup["time"].dt.date
+    meta_lookup["_idx"] = np.arange(len(meta_lookup))
+    
+    # Merge
+    merged = meta_lookup.merge(
+        preds_df[["lat_key", "lon_key", "date_key", "reg_pred_anomaly"]],
+        on=["lat_key", "lon_key", "date_key"],
+        how="left"
+    )
+    
+    # Sort back to original order
+    merged = merged.sort_values("_idx")
+    
+    # Check for missing matches
+    n_missing = merged["reg_pred_anomaly"].isna().sum()
+    n_total = len(merged)
+    
+    if verbose:
+        print(f"  [Reg Predictions] Matched {n_total - n_missing:,}/{n_total:,} samples")
+        if n_missing > 0:
+            print(f"    [Warning] {n_missing:,} samples have no matching regression prediction")
+    
+    # Fill missing with 0 (neutral anomaly)
+    result = merged["reg_pred_anomaly"].fillna(0.0).values
+    
+    return result
 
 
 def evaluate_year(
@@ -56,11 +150,24 @@ def evaluate_year(
     for col in land_cols:
         if col in meta_with_land.columns:
             X[col] = meta_with_land[col].values
+    
+    # 3. Regression Predictions as Feature
+    reg_pred_cfg = config.get("regression_predictions", {})
+    reg_pred_dir = reg_pred_cfg.get("predictions_dir", "artifacts/coldwave_reg/predictions")
+    use_reg_pred = reg_pred_cfg.get("enabled", True)  # Default to True if predictions exist
+    
+    if use_reg_pred:
+        print(f"  Loading regression predictions as feature...")
+        reg_preds = load_regression_predictions(reg_pred_dir, meta, verbose=True)
+        
+        if reg_preds is not None:
+            X["reg_pred_anomaly"] = reg_preds
+            print(f"  Added regression prediction feature: reg_pred_anomaly")
+        else:
+            print("  [Warning] Regression predictions not available, skipping this feature")
             
-    print(f"  Added static features. Total features: {len(X.columns)}")
+    print(f"  Total features after integration: {len(X.columns)}")
     # --------------------------------------
-
-
 
     proba = model.predict_proba(X)[:, 1]
     preds = (proba >= threshold).astype(int)

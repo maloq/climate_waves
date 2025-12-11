@@ -4,27 +4,27 @@ Binarization threshold: 10.0
 Mode: cold
 
 Regression Metrics (on anomaly):
-Train RMSE: 3.0433
-Val RMSE:   3.9025
-Val MAE:    2.9670
-Val R2:     0.2652
+Train RMSE: 3.0425
+Val RMSE:   3.8899
+Val MAE:    2.9559
+Val R2:     0.2701
 
 ============================================================
 
 Validation Classification Metrics:
-  Balanced Accuracy: 0.7328
-  Precision:         0.5056
-  Recall:            0.6679
-  F1 Score:          0.5755
-  Specificity:       0.7978
+  Balanced Accuracy: 0.7330
+  Precision:         0.5064
+  Recall:            0.6674
+  F1 Score:          0.5758
+  Specificity:       0.7987
 
   Confusion Matrix:
-    TN: 519,035  FP: 131,573
-    FN: 66,916  TP: 134,560
+    TN: 3,118,552  FP: 785,965
+    FN: 401,789  TP: 806,190
 
 Training Classification Metrics:
   Balanced Accuracy: 0.8235
-  F1 Score:          0.7146
+  F1 Score:          0.7147
 
 ============================================================
 

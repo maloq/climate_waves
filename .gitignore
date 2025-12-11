@@ -8,3 +8,4 @@ cache
 **/*.parquet
 *.png
 output
+job_script.sh

@@ -1,9 +1,9 @@
 data:
   features_dir: /home/infres/vmorozov/Misc/data/climate_data_files/ECMWF
   feature_file_template: "{variable}/{variable}_*.zarr"
-  target_dir: climate_data/target_reg/cold_waves
-  target_file_template: "target_temperature_p05_{year}.zarr"
-  target_var: target_temperature_p05
+  target_dir: climate_data/target_reg/wind
+  target_file_template: "target_wind_gust_p95_{year}.zarr"
+  target_var: target_wind_gust_p95
   latitude_range: [40.0, 60.0]
   longitude_range: [30.0, 120.0]
   train_years: [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023]
@@ -18,7 +18,6 @@ features:
 - u10
 - v10
 - msl
-- sd
 
 
 feature_engineering:
@@ -46,7 +45,6 @@ feature_engineering:
       - u10
       - v10
       - msl
-      - sd
 
     spans: [3, 7, 14]
 
@@ -57,7 +55,6 @@ feature_engineering:
       - u10
       - v10
       - msl
-      - sd
     window_sizes: [5, 11]
     stats: [mean, std, min, max]
 
@@ -73,7 +70,6 @@ feature_engineering:
     variables:
       - t2m
       - msl
-      - sd
     periods: [1, 3, 7, 14]
 
     climatology:
@@ -99,7 +95,6 @@ feature_engineering:
       - u10
       - v10
       - msl
-      - sd
 
     stats: [mean, std, min, max]
 
@@ -125,26 +120,26 @@ output:
 
 binarization:
   enabled: true
-  threshold_file: "climate_data/target_reg/daily_average_cold.nc"
-  threshold_val: 12.0
-  operator: "less"
+  threshold_file: None
+  threshold_val: 21.0
+  operator: "greater"
   threshold_optimization: false 
 
 # Compare binarized regression predictions with external binary target
 binary_comparison:
   enabled: true
-  target_dir: "climate_data/target/target_cold_waves_span_30_threshold_7"
-  target_file_template: "extemp_minus_7_{year}.nc"
-  target_var: "extemp_minus"
+  target_dir: "climate_data/target/target_fg10_north"
+  target_file_template: "binary_daily_data_fg10_21_{year}.nc"
+  target_var: "fg10"
 
 # Sample weights for extreme temperatures
 # More extreme anomalies get higher weight during training
 # Note: Too aggressive weights can cause overprediction of extremes
 sample_weights:
-  weight_normal: 1.0           # |anomaly| < 5°C
-  weight_moderate: 3.0         # 5 <= |anomaly| < 10°C  
-  weight_extreme: 6.0          # 10 <= |anomaly| < 15°C (cold/heat wave)
-  weight_very_extreme: 8.0     # |anomaly| >= 15°C
-  threshold_moderate: 4.0
-  threshold_extreme: 7.0
-  threshold_very_extreme: 10.0
+  weight_normal: 1.0          
+  weight_moderate: 3.0         
+  weight_extreme: 6.0          
+  weight_very_extreme: 8.0     
+  threshold_moderate: 15.0
+  threshold_extreme: 21.0
+  threshold_very_extreme: 25.0

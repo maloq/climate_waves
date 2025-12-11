@@ -194,23 +194,31 @@ def train_model(config: Dict) -> None:
     print(f"Data loaded: {len(X):,} samples, {len(X.columns)} features")
     print(f"Raw target stats: min={y.min():.3f}, max={y.max():.3f}, mean={y.mean():.3f}, std={y.std():.3f}")
 
-    # --- Subtract Daily Average to Create Anomaly ---
-    print("\n" + "=" * 60)
-    print("COMPUTING TEMPERATURE ANOMALY")
-    print("=" * 60)
+    # --- Optionally Subtract Daily Average to Create Anomaly ---
+    climatology_path = binarization_cfg.get("threshold_file")
+    use_anomaly = climatology_path is not None and str(climatology_path).lower() not in ("none", "")
     
-    climatology_path = binarization_cfg.get("threshold_file", "climate_data/target_reg/daily_average_cold.nc")
-    daily_avg = load_daily_average(climatology_path, meta)
-    
-    # Store original target for reference
-    y_raw = y.copy()
-    
-    # Compute anomaly: temperature - daily_average
-    y_anomaly = y.values - daily_avg
-    y = pd.Series(y_anomaly, index=y.index)
-    
-    print(f"  Daily average stats: min={daily_avg.min():.3f}, max={daily_avg.max():.3f}, mean={daily_avg.mean():.3f}")
-    print(f"  Anomaly stats: min={y.min():.3f}, max={y.max():.3f}, mean={y.mean():.3f}, std={y.std():.3f}")
+    if use_anomaly:
+        print("\n" + "=" * 60)
+        print("COMPUTING TEMPERATURE ANOMALY")
+        print("=" * 60)
+        
+        daily_avg = load_daily_average(climatology_path, meta)
+        
+        # Store original target for reference
+        y_raw = y.copy()
+        
+        # Compute anomaly: temperature - daily_average
+        y_anomaly = y.values - daily_avg
+        y = pd.Series(y_anomaly, index=y.index)
+        
+        print(f"  Daily average stats: min={daily_avg.min():.3f}, max={daily_avg.max():.3f}, mean={daily_avg.mean():.3f}")
+        print(f"  Anomaly stats: min={y.min():.3f}, max={y.max():.3f}, mean={y.mean():.3f}, std={y.std():.3f}")
+    else:
+        print("\n" + "=" * 60)
+        print("USING RAW TARGET VALUES (no threshold_file specified)")
+        print("=" * 60)
+        print(f"  Target stats: min={y.min():.3f}, max={y.max():.3f}, mean={y.mean():.3f}, std={y.std():.3f}")
     
     # --- Compute Sample Weights ---
     print("\n" + "=" * 60)
@@ -406,8 +414,12 @@ def train_model(config: Dict) -> None:
 
     report_path = model_path.with_suffix(".report.txt")
     with report_path.open("w") as f:
-        f.write("Training Regression Report (Anomaly-based)\n")
-        f.write(f"Climatology file: {climatology_path}\n")
+        if use_anomaly:
+            f.write("Training Regression Report (Anomaly-based)\n")
+            f.write(f"Climatology file: {climatology_path}\n")
+        else:
+            f.write("Training Regression Report (Raw target values)\n")
+            f.write("Climatology file: None (using raw target)\n")
         f.write(f"Binarization threshold: {binary_threshold}\n")
         f.write(f"Mode: {binary_mode}\n")
         f.write("\n")

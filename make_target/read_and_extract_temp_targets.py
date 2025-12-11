@@ -9,7 +9,7 @@ import numba
 # --- Configuration ---
 DATA_DIR = "/home/tehbek/code/climate_data_era5/reanalysis-era5-single-levels-temperature"
 OUTPUT_DIR = "/home/tehbek/code/climate_data_era5/results"
-WINDOW_DAYS = 14
+WINDOW_DAYS = 7
 PERCENTILES = [0.05, 0.95]
 VAR_NAME_GUESS = "t2m"
 START_YEAR = 2010
@@ -182,7 +182,7 @@ def process_year(year, year_files, prev_year_files, next_year_files, var_name):
     # Calculate window size in steps
     if len(times) > 1:
         time_diff = (times[1] - times[0]).astype('timedelta64[s]').astype(int)
-        window_steps = int(WINDOW_DAYS * 24 * 3600 // time_diff)
+        window_steps = int(WINDOW_DAYS * 48 * 3600 // time_diff)
     else:
         print("  Error: Not enough time steps")
         return

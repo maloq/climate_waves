@@ -24,6 +24,6 @@ cd /home/infres/vmorozov/code
 export PYTHONPATH=$PYTHONPATH:/home/infres/vmorozov/code
 
 # Run the Python script
-python train_climate_reg.py --config configs/config_climate_reg_cold.yaml
+python train_climate_reg.py --config configs/config_climate_reg_wind.yaml
 
 echo "Job finished at: $(date)"

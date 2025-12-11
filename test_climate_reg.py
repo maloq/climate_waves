@@ -17,7 +17,7 @@ from sklearn.metrics import (
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
-from load_climate_data import load_config, load_years
+from load_climate_data import load_config, load_years, load_targets_lazy
 from prepare_land import prepare_land_data, landsea_distance
 
 # Try to import cartopy for geographic projections, fallback to simple plots
@@ -28,6 +28,84 @@ try:
 except ImportError:
     HAS_CARTOPY = False
     print("Warning: cartopy not installed. Using simple lat/lon plots.")
+
+
+def load_external_binary_target(
+    target_dir: str,
+    target_file_template: str,
+    target_var: str,
+    meta: pd.DataFrame,
+    year: int,
+    lat_range: Tuple[float, float],
+    lon_range: Tuple[float, float]
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load external binary target using load_targets_lazy and map to metadata samples.
+    
+    Args:
+        target_dir: Directory containing target files
+        target_file_template: Template for target file names (e.g., "extemp_minus_7_{year}.nc")
+        target_var: Variable name in the NetCDF file (e.g., "extemp_minus")
+        meta: DataFrame with 'time', 'latitude', 'longitude' columns
+        year: Year to load
+        lat_range: Latitude range tuple
+        lon_range: Longitude range tuple
+        
+    Returns:
+        Tuple of (binary_target array, valid_mask array)
+    """
+    # Use the existing load_targets_lazy function
+    ds = load_targets_lazy(
+        years=[year],
+        target_dir=target_dir,
+        file_template=target_file_template,
+        lat_range=lat_range,
+        lon_range=lon_range
+    )
+    
+    # Extract target data
+    target_data = ds[target_var].values  # Shape: (time, lat, lon)
+    target_times = pd.to_datetime(ds['time'].values)
+    target_lats = ds['latitude'].values
+    target_lons = ds['longitude'].values
+    
+    # Map to metadata samples
+    meta_time = pd.to_datetime(meta["time"])
+    lats = meta["latitude"].values
+    lons = meta["longitude"].values
+    
+    # Build lookup indices using nearest neighbor matching
+    lat_indices = np.abs(target_lats[:, None] - lats[None, :]).argmin(axis=0)
+    lon_indices = np.abs(target_lons[:, None] - lons[None, :]).argmin(axis=0)
+    
+    # For time, match dates
+    target_dates = pd.Series(target_times).dt.date.values
+    meta_dates = meta_time.dt.date.values
+    
+    # Create a date-to-index mapping
+    date_to_idx = {d: i for i, d in enumerate(target_dates)}
+    
+    # Map each meta date to the corresponding target index
+    time_indices = np.array([date_to_idx.get(d, -1) for d in meta_dates])
+    
+    # Handle missing dates
+    valid_mask = time_indices >= 0
+    if not valid_mask.all():
+        n_missing = (~valid_mask).sum()
+        print(f"  Warning: {n_missing} samples have no matching date in binary target")
+    
+    # Extract values (set missing to 0 for now)
+    binary_target = np.zeros(len(meta), dtype=np.int32)
+    valid_indices = np.where(valid_mask)[0]
+    
+    for idx in valid_indices:
+        t_idx = time_indices[idx]
+        lat_idx = lat_indices[idx]
+        lon_idx = lon_indices[idx]
+        binary_target[idx] = int(target_data[t_idx, lat_idx, lon_idx])
+    
+    ds.close()
+    return binary_target, valid_mask
 
 
 def load_daily_average(climatology_path: str, meta: pd.DataFrame) -> np.ndarray:
@@ -588,6 +666,7 @@ def test_model(config: Dict) -> None:
     data_cfg = config["data"]
     output_cfg = config["output"]
     bin_cfg = config.get("binarization", {})
+    bin_cmp_cfg = config.get("binary_comparison", {})
     
     print(f"\nTest years: {data_cfg['test_years']}")
     print(f"Loading model from: {output_cfg['model_path']}")
@@ -595,14 +674,32 @@ def test_model(config: Dict) -> None:
     model = CatBoostRegressor()
     model.load_model(output_cfg["model_path"])
     
-    # Load climatology for anomaly computation
-    climatology_path = bin_cfg.get("threshold_file", "climate_data/target_reg/daily_average_cold.nc")
-    print(f"Loading climatology from: {climatology_path}")
+    # Check if we should compute anomaly or use raw target
+    climatology_path = bin_cfg.get("threshold_file")
+    use_anomaly = climatology_path is not None and str(climatology_path).lower() not in ("none", "")
+    
+    if use_anomaly:
+        print(f"Loading climatology from: {climatology_path}")
+    else:
+        print("Using raw target values (no threshold_file specified)")
     
     # Binarization settings
     binary_threshold = bin_cfg.get("threshold_val", 10.0)
     binary_mode = "cold" if bin_cfg.get("operator", "less") == "less" else "heat"
+    threshold_optimization_enabled = bin_cfg.get("threshold_optimization", True)
     print(f"Binarization: threshold={binary_threshold}, mode={binary_mode}")
+    print(f"Threshold optimization: {'enabled' if threshold_optimization_enabled else 'disabled'}")
+    
+    # External binary comparison settings
+    bin_cmp_enabled = bin_cmp_cfg.get("enabled", False)
+    if bin_cmp_enabled:
+        bin_cmp_target_dir = bin_cmp_cfg.get("target_dir")
+        bin_cmp_file_template = bin_cmp_cfg.get("target_file_template")
+        bin_cmp_target_var = bin_cmp_cfg.get("target_var")
+        print(f"\nExternal binary comparison enabled:")
+        print(f"  Target dir: {bin_cmp_target_dir}")
+        print(f"  File template: {bin_cmp_file_template}")
+        print(f"  Target var: {bin_cmp_target_var}")
             
     # Accumulate metrics and data for plotting
     all_y_true_anomaly = []
@@ -611,7 +708,12 @@ def test_model(config: Dict) -> None:
     all_y_pred_bin = []
     all_meta_list = []
     
+    # For external binary comparison
+    all_ext_bin_target = []
+    all_ext_bin_valid_mask = []
+    
     table_results = []
+    ext_bin_results = []  # Separate table for external binary comparison
     year_data = {}  # Store per-year data for individual plots
     
     # Process year by year
@@ -635,9 +737,12 @@ def test_model(config: Dict) -> None:
             print(f"No data for {year}.")
             continue
 
-        # Compute anomaly (subtract daily average)
-        daily_avg = load_daily_average(climatology_path, meta)
-        y_anomaly = y_raw.values - daily_avg
+        # Compute anomaly (subtract daily average) or use raw values
+        if use_anomaly:
+            daily_avg = load_daily_average(climatology_path, meta)
+            y_anomaly = y_raw.values - daily_avg
+        else:
+            y_anomaly = y_raw.values
 
         # Feature Integration (Must match training!)
         # 1. Distance
@@ -705,6 +810,52 @@ def test_model(config: Dict) -> None:
             "Events_True": int(y_true_binary.sum()),
             "Events_Pred": int(y_pred_binary.sum())
         })
+        
+        # Load external binary target if enabled
+        if bin_cmp_enabled:
+            try:
+                lat_range = tuple(data_cfg["latitude_range"])
+                lon_range = tuple(data_cfg["longitude_range"])
+                
+                ext_bin_target, ext_valid_mask = load_external_binary_target(
+                    target_dir=bin_cmp_target_dir,
+                    target_file_template=bin_cmp_file_template,
+                    target_var=bin_cmp_target_var,
+                    meta=meta,
+                    year=year,
+                    lat_range=lat_range,
+                    lon_range=lon_range
+                )
+                
+                all_ext_bin_target.extend(ext_bin_target)
+                all_ext_bin_valid_mask.extend(ext_valid_mask)
+                
+                # Store in year_data
+                year_data[year]["ext_bin_target"] = ext_bin_target
+                year_data[year]["ext_valid_mask"] = ext_valid_mask
+                
+                # Per-year external binary comparison (only on valid samples)
+                valid_idx = ext_valid_mask
+                if valid_idx.sum() > 0:
+                    ext_metrics = compute_classification_metrics(
+                        ext_bin_target[valid_idx], 
+                        y_pred_binary[valid_idx]
+                    )
+                    print(f"  External Binary - F1: {ext_metrics['f1']:.4f}, Recall: {ext_metrics['recall']:.4f}, Precision: {ext_metrics['precision']:.4f}")
+                    print(f"  External Events: {y_pred_binary[valid_idx].sum():,} predicted / {ext_bin_target[valid_idx].sum():,} actual")
+                    
+                    ext_bin_results.append({
+                        "Year": str(year),
+                        "F1": ext_metrics["f1"],
+                        "Recall": ext_metrics["recall"],
+                        "Precision": ext_metrics["precision"],
+                        "Bal_Acc": ext_metrics["balanced_accuracy"],
+                        "Events_True": int(ext_bin_target[valid_idx].sum()),
+                        "Events_Pred": int(y_pred_binary[valid_idx].sum()),
+                        "Valid_Samples": int(valid_idx.sum())
+                    })
+            except Exception as e:
+                print(f"  Warning: Could not load external binary target for {year}: {e}")
 
     # Final Metrics
     print("\n" + "=" * 60)
@@ -743,72 +894,166 @@ def test_model(config: Dict) -> None:
         
         print(f"\n  Total Events: {all_y_pred_bin.sum():,} predicted / {all_y_true_bin.sum():,} actual")
         
-        # --- THRESHOLD OPTIMIZATION ---
-        print("\n" + "=" * 60)
-        print("THRESHOLD OPTIMIZATION")
-        print("=" * 60)
+        # Initialize variables for optional optimization
+        opt_metrics = None
+        opt_pred_threshold = binary_threshold
+        all_y_pred_bin_opt = all_y_pred_bin.copy()
+        best_offset = 0.0
         
-        best_offset, best_f1, opt_metrics = find_optimal_threshold(
-            all_y_true_anomaly, all_y_pred_anomaly,
-            base_threshold=binary_threshold,
-            mode=binary_mode,
-            search_range=(-5.0, 5.0),
-            n_steps=100
-        )
-        
-        print(f"\nOptimal threshold offset: {best_offset:+.2f}")
-        print(f"Effective prediction threshold: {binary_threshold + best_offset:.2f}")
-        print(f"(Ground truth threshold remains: {binary_threshold})")
-        print(f"\nWith OPTIMIZED threshold:")
-        print(f"  F1 Score:          {opt_metrics['f1']:.4f} (was {overall_metrics['f1']:.4f})")
-        print(f"  Balanced Accuracy: {opt_metrics['balanced_accuracy']:.4f}")
-        print(f"  Precision:         {opt_metrics['precision']:.4f}")
-        print(f"  Recall:            {opt_metrics['recall']:.4f}")
-        print(f"\n  Confusion Matrix (optimized):")
-        print(f"    TN: {opt_metrics['true_negatives']:,}  FP: {opt_metrics['false_positives']:,}")
-        print(f"    FN: {opt_metrics['false_negatives']:,}  TP: {opt_metrics['true_positives']:,}")
-        
-        # --- CALIBRATION ---
-        print("\n" + "=" * 60)
-        print("PREDICTION CALIBRATION")
-        print("=" * 60)
-        
-        for cal_method in ["mean_shift", "std_scale", "both"]:
-            calibrated_preds = calibrate_predictions(all_y_pred_anomaly, all_y_true_anomaly, method=cal_method)
+        # --- THRESHOLD OPTIMIZATION (Optional) ---
+        if threshold_optimization_enabled:
+            print("\n" + "=" * 60)
+            print("THRESHOLD OPTIMIZATION")
+            print("=" * 60)
             
-            # Evaluate calibrated predictions at original threshold
-            cal_pred_bin = binarize_for_classification(calibrated_preds, binary_threshold, binary_mode)
-            cal_metrics = compute_classification_metrics(all_y_true_bin, cal_pred_bin)
-            
-            # Also find optimal threshold for calibrated
-            cal_offset, cal_best_f1, cal_opt_metrics = find_optimal_threshold(
-                all_y_true_anomaly, calibrated_preds,
+            best_offset, best_f1, opt_metrics = find_optimal_threshold(
+                all_y_true_anomaly, all_y_pred_anomaly,
                 base_threshold=binary_threshold,
-                mode=binary_mode
+                mode=binary_mode,
+                search_range=(-5.0, 5.0),
+                n_steps=100
             )
             
-            print(f"\nCalibration method: {cal_method}")
-            print(f"  At original threshold ({binary_threshold}):")
-            print(f"    F1: {cal_metrics['f1']:.4f}, Recall: {cal_metrics['recall']:.4f}, Precision: {cal_metrics['precision']:.4f}")
-            print(f"    Events: {cal_pred_bin.sum():,} predicted")
-            print(f"  With optimal threshold ({binary_threshold + cal_offset:.2f}):")
-            print(f"    F1: {cal_opt_metrics['f1']:.4f}, Recall: {cal_opt_metrics['recall']:.4f}, Precision: {cal_opt_metrics['precision']:.4f}")
-        
-        # Store optimized predictions for maps
-        opt_pred_threshold = binary_threshold + best_offset
-        all_y_pred_bin_opt = binarize_for_classification(all_y_pred_anomaly, opt_pred_threshold, binary_mode)
-        
-        # Update year_data with optimized binary predictions
-        for year, data in year_data.items():
-            data["y_pred_bin_opt"] = binarize_for_classification(
-                data["y_pred_anomaly"], opt_pred_threshold, binary_mode
-            )
+            print(f"\nOptimal threshold offset: {best_offset:+.2f}")
+            print(f"Effective prediction threshold: {binary_threshold + best_offset:.2f}")
+            print(f"(Ground truth threshold remains: {binary_threshold})")
+            print(f"\nWith OPTIMIZED threshold:")
+            print(f"  F1 Score:          {opt_metrics['f1']:.4f} (was {overall_metrics['f1']:.4f})")
+            print(f"  Balanced Accuracy: {opt_metrics['balanced_accuracy']:.4f}")
+            print(f"  Precision:         {opt_metrics['precision']:.4f}")
+            print(f"  Recall:            {opt_metrics['recall']:.4f}")
+            print(f"\n  Confusion Matrix (optimized):")
+            print(f"    TN: {opt_metrics['true_negatives']:,}  FP: {opt_metrics['false_positives']:,}")
+            print(f"    FN: {opt_metrics['false_negatives']:,}  TP: {opt_metrics['true_positives']:,}")
+            
+            # --- CALIBRATION ---
+            print("\n" + "=" * 60)
+            print("PREDICTION CALIBRATION")
+            print("=" * 60)
+            
+            for cal_method in ["mean_shift", "std_scale", "both"]:
+                calibrated_preds = calibrate_predictions(all_y_pred_anomaly, all_y_true_anomaly, method=cal_method)
+                
+                # Evaluate calibrated predictions at original threshold
+                cal_pred_bin = binarize_for_classification(calibrated_preds, binary_threshold, binary_mode)
+                cal_metrics = compute_classification_metrics(all_y_true_bin, cal_pred_bin)
+                
+                # Also find optimal threshold for calibrated
+                cal_offset, cal_best_f1, cal_opt_metrics = find_optimal_threshold(
+                    all_y_true_anomaly, calibrated_preds,
+                    base_threshold=binary_threshold,
+                    mode=binary_mode
+                )
+                
+                print(f"\nCalibration method: {cal_method}")
+                print(f"  At original threshold ({binary_threshold}):")
+                print(f"    F1: {cal_metrics['f1']:.4f}, Recall: {cal_metrics['recall']:.4f}, Precision: {cal_metrics['precision']:.4f}")
+                print(f"    Events: {cal_pred_bin.sum():,} predicted")
+                print(f"  With optimal threshold ({binary_threshold + cal_offset:.2f}):")
+                print(f"    F1: {cal_opt_metrics['f1']:.4f}, Recall: {cal_opt_metrics['recall']:.4f}, Precision: {cal_opt_metrics['precision']:.4f}")
+            
+            # Store optimized predictions for maps
+            opt_pred_threshold = binary_threshold + best_offset
+            all_y_pred_bin_opt = binarize_for_classification(all_y_pred_anomaly, opt_pred_threshold, binary_mode)
+            
+            # Update year_data with optimized binary predictions
+            for year, data in year_data.items():
+                data["y_pred_bin_opt"] = binarize_for_classification(
+                    data["y_pred_anomaly"], opt_pred_threshold, binary_mode
+                )
         
         # Full classification report
         print("\n" + "=" * 60)
         print("DETAILED CLASSIFICATION REPORT (Original Threshold)")
         print("=" * 60)
         print(classification_report(all_y_true_bin, all_y_pred_bin, zero_division=0))
+        
+        # --- EXTERNAL BINARY TARGET COMPARISON ---
+        if bin_cmp_enabled and all_ext_bin_target:
+            print("\n" + "=" * 60)
+            print("EXTERNAL BINARY TARGET COMPARISON")
+            print("=" * 60)
+            
+            all_ext_bin_target_arr = np.array(all_ext_bin_target)
+            all_ext_bin_valid_mask_arr = np.array(all_ext_bin_valid_mask)
+            
+            # Compute metrics only on valid samples
+            valid_idx = all_ext_bin_valid_mask_arr
+            n_valid = valid_idx.sum()
+            n_total = len(valid_idx)
+            
+            print(f"\nValid samples: {n_valid:,} / {n_total:,} ({100*n_valid/n_total:.1f}%)")
+            
+            if n_valid > 0:
+                ext_true = all_ext_bin_target_arr[valid_idx]
+                ext_pred = all_y_pred_bin[valid_idx]
+                
+                ext_overall_metrics = compute_classification_metrics(ext_true, ext_pred)
+                
+                print(f"\nBinarized Regression vs External Binary Target:")
+                print(f"  Balanced Accuracy: {ext_overall_metrics['balanced_accuracy']:.4f}")
+                print(f"  Precision:         {ext_overall_metrics['precision']:.4f}")
+                print(f"  Recall:            {ext_overall_metrics['recall']:.4f}")
+                print(f"  F1 Score:          {ext_overall_metrics['f1']:.4f}")
+                print(f"  Specificity:       {ext_overall_metrics['specificity']:.4f}")
+                print(f"\n  Confusion Matrix:")
+                print(f"    TN: {ext_overall_metrics['true_negatives']:,}  FP: {ext_overall_metrics['false_positives']:,}")
+                print(f"    FN: {ext_overall_metrics['false_negatives']:,}  TP: {ext_overall_metrics['true_positives']:,}")
+                print(f"\n  Total Events: {ext_pred.sum():,} predicted / {ext_true.sum():,} actual (external)")
+                
+                # Also compare with optimized threshold predictions (if optimization was enabled)
+                ext_opt_metrics = None
+                if threshold_optimization_enabled:
+                    ext_pred_opt = all_y_pred_bin_opt[valid_idx]
+                    ext_opt_metrics = compute_classification_metrics(ext_true, ext_pred_opt)
+                    
+                    print(f"\nWith OPTIMIZED prediction threshold ({opt_pred_threshold:.2f}):")
+                    print(f"  Balanced Accuracy: {ext_opt_metrics['balanced_accuracy']:.4f}")
+                    print(f"  Precision:         {ext_opt_metrics['precision']:.4f}")
+                    print(f"  Recall:            {ext_opt_metrics['recall']:.4f}")
+                    print(f"  F1 Score:          {ext_opt_metrics['f1']:.4f}")
+                    print(f"\n  Confusion Matrix (optimized):")
+                    print(f"    TN: {ext_opt_metrics['true_negatives']:,}  FP: {ext_opt_metrics['false_positives']:,}")
+                    print(f"    FN: {ext_opt_metrics['false_negatives']:,}  TP: {ext_opt_metrics['true_positives']:,}")
+                
+                # Compare binarized regression target with external binary target
+                binarized_reg_true = all_y_true_bin[valid_idx]
+                target_agreement = compute_classification_metrics(ext_true, binarized_reg_true)
+                
+                print(f"\nAgreement between Binarized Regression Target and External Binary Target:")
+                print(f"  Accuracy:          {target_agreement['accuracy']:.4f}")
+                print(f"  F1 Score:          {target_agreement['f1']:.4f}")
+                print(f"  Events: {binarized_reg_true.sum():,} (binarized reg) vs {ext_true.sum():,} (external)")
+                
+                # Full classification report for external comparison
+                print("\n" + "-" * 40)
+                print("Classification Report (vs External Binary Target):")
+                print(classification_report(ext_true, ext_pred, zero_division=0))
+                
+                # Add to external binary results table
+                ext_bin_results.append({
+                    "Year": "ALL",
+                    "F1": ext_overall_metrics["f1"],
+                    "Recall": ext_overall_metrics["recall"],
+                    "Precision": ext_overall_metrics["precision"],
+                    "Bal_Acc": ext_overall_metrics["balanced_accuracy"],
+                    "Events_True": int(ext_true.sum()),
+                    "Events_Pred": int(ext_pred.sum()),
+                    "Valid_Samples": int(n_valid)
+                })
+                
+                # Add optimized row only if optimization was enabled
+                if threshold_optimization_enabled and ext_opt_metrics is not None:
+                    ext_bin_results.append({
+                        "Year": "OPT",
+                        "F1": ext_opt_metrics["f1"],
+                        "Recall": ext_opt_metrics["recall"],
+                        "Precision": ext_opt_metrics["precision"],
+                        "Bal_Acc": ext_opt_metrics["balanced_accuracy"],
+                        "Events_True": int(ext_true.sum()),
+                        "Events_Pred": int(ext_pred_opt.sum()),
+                        "Valid_Samples": int(n_valid)
+                    })
     
     print("=" * 60)
     
@@ -834,19 +1079,20 @@ def test_model(config: Dict) -> None:
             "Events_Pred": int(all_y_pred_bin.sum())
         })
         
-        # Add optimized results row
-        table_results.append({
-            "Year": "OPT",
-            "RMSE": rmse_global,
-            "MAE": mae_global,
-            "R2": r2_global,
-            "F1": opt_metrics["f1"],
-            "Recall": opt_metrics["recall"],
-            "Precision": opt_metrics["precision"],
-            "Bal_Acc": opt_metrics["balanced_accuracy"],
-            "Events_True": int(all_y_true_bin.sum()),
-            "Events_Pred": int(opt_metrics["true_positives"] + opt_metrics["false_positives"])
-        })
+        # Add optimized results row (only if optimization was enabled)
+        if threshold_optimization_enabled and opt_metrics is not None:
+            table_results.append({
+                "Year": "OPT",
+                "RMSE": rmse_global,
+                "MAE": mae_global,
+                "R2": r2_global,
+                "F1": opt_metrics["f1"],
+                "Recall": opt_metrics["recall"],
+                "Precision": opt_metrics["precision"],
+                "Bal_Acc": opt_metrics["balanced_accuracy"],
+                "Events_True": int(all_y_true_bin.sum()),
+                "Events_Pred": int(opt_metrics["true_positives"] + opt_metrics["false_positives"])
+            })
         
         print("\n" + "=" * 100)
         print("AGGREGATED RESULTS TABLE")
@@ -862,6 +1108,21 @@ def test_model(config: Dict) -> None:
         print(df_results.to_string(index=False))
         print("=" * 100 + "\n")
         
+        # Print external binary comparison table if available
+        if bin_cmp_enabled and ext_bin_results:
+            print("\n" + "=" * 100)
+            print("EXTERNAL BINARY TARGET COMPARISON TABLE")
+            print("=" * 100)
+            df_ext_results = pd.DataFrame(ext_bin_results)
+            
+            format_cols_ext = ["F1", "Recall", "Precision", "Bal_Acc"]
+            for col in format_cols_ext:
+                if col in df_ext_results.columns:
+                    df_ext_results[col] = df_ext_results[col].apply(lambda x: f"{x:.4f}" if pd.notnull(x) else "-")
+            
+            print(df_ext_results.to_string(index=False))
+            print("=" * 100 + "\n")
+        
     # Save predictions and generate plots
     pred_dir = output_cfg.get("predictions_dir")
     if pred_dir and all_y_true_anomaly is not None:
@@ -872,6 +1133,12 @@ def test_model(config: Dict) -> None:
         metrics_path = pred_dir_path / "test_metrics.csv"
         pd.DataFrame(table_results).to_csv(metrics_path, index=False)
         print(f"Saved test metrics to {metrics_path}")
+        
+        # Save external binary comparison metrics if available
+        if bin_cmp_enabled and ext_bin_results:
+            ext_metrics_path = pred_dir_path / "test_metrics_ext_binary.csv"
+            pd.DataFrame(ext_bin_results).to_csv(ext_metrics_path, index=False)
+            print(f"Saved external binary comparison metrics to {ext_metrics_path}")
         
         # Generate maps for all years combined
         print("\n" + "=" * 60)
