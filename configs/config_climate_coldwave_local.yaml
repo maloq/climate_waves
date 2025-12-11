@@ -67,7 +67,7 @@ feature_engineering:
       # - u_component_of_wind_h00_lvl1000
       # - temperature_h00_lvl1000
       # - v_component_of_wind_h00_lvl1000
-    spans: [3, 7, 14, 30]
+    spans: [3, 7, 14]
 
   # Spatial stats
   spatial:
@@ -121,7 +121,7 @@ feature_engineering:
       # - u_component_of_wind_h00_lvl1000
       # - temperature_h00_lvl1000
       # - v_component_of_wind_h00_lvl1000
-    periods: [1, 3, 7, 14, 30]
+    periods: [1, 3, 7, 14]
 
     climatology:
       variables:

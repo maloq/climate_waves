@@ -596,8 +596,13 @@ def load_single_year(
         except ImportError:
             pass
         
-        with xr.open_dataset(feature_path, **engine_kwargs) as features, \
-             xr.open_dataset(target_path, **engine_kwargs) as target:
+        # Detect if target is zarr or netcdf
+        if str(target_path).endswith('.zarr'):
+            target = xr.open_zarr(target_path)
+        else:
+            target = xr.open_dataset(target_path, **engine_kwargs)
+        
+        with xr.open_dataset(feature_path, **engine_kwargs) as features, target:
             
             if "date" in features.coords: features = features.rename({"date": "time"})
             

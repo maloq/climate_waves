@@ -122,17 +122,17 @@ def _ewm_numpy(data: np.ndarray, alpha: float, axis: int = 0) -> np.ndarray:
 
 
 if HAS_NUMBA:
-    @jit(nopython=True, parallel=True, cache=True)
+    @jit(nopython=True, parallel=False, cache=False)
     def _ewm_3d_numba(data: np.ndarray, alpha: float) -> np.ndarray:
         """Numba-accelerated EWM for 3D arrays (time, lat, lon).
         
-        Parallelized over spatial dimensions for maximum throughput.
+        Serial execution to avoid thread conflicts with Dask/Zarr.
         """
         n_time, n_lat, n_lon = data.shape
         result = np.empty_like(data)
         decay = 1.0 - alpha
         
-        for i in prange(n_lat):
+        for i in range(n_lat):
             for j in range(n_lon):
                 # Initialize
                 result[0, i, j] = data[0, i, j]
@@ -158,13 +158,13 @@ else:
 # =============================================================================
 
 if HAS_NUMBA:
-    @jit(nopython=True, parallel=True, cache=True)
+    @jit(nopython=True, parallel=False, cache=False)
     def _spatial_mean_3d_numba(data: np.ndarray, window_size: int, min_periods: int) -> np.ndarray:
         n_time, n_lat, n_lon = data.shape
         result = np.full_like(data, np.nan)
         radius = window_size // 2
 
-        for t in prange(n_time):
+        for t in range(n_time):
             for i in range(n_lat):
                 for j in range(n_lon):
                     i_start = max(0, i - radius)
@@ -186,13 +186,13 @@ if HAS_NUMBA:
                         result[t, i, j] = acc / count
         return result
 
-    @jit(nopython=True, parallel=True, cache=True)
+    @jit(nopython=True, parallel=False, cache=False)
     def _spatial_std_3d_numba(data: np.ndarray, window_size: int, min_periods: int) -> np.ndarray:
         n_time, n_lat, n_lon = data.shape
         result = np.full_like(data, np.nan)
         radius = window_size // 2
 
-        for t in prange(n_time):
+        for t in range(n_time):
             for i in range(n_lat):
                 for j in range(n_lon):
                     i_start = max(0, i - radius)
@@ -220,13 +220,13 @@ if HAS_NUMBA:
                         result[t, i, j] = np.sqrt(var)
         return result
 
-    @jit(nopython=True, parallel=True, cache=True)
+    @jit(nopython=True, parallel=False, cache=False)
     def _spatial_min_3d_numba(data: np.ndarray, window_size: int, min_periods: int) -> np.ndarray:
         n_time, n_lat, n_lon = data.shape
         result = np.full_like(data, np.nan)
         radius = window_size // 2
 
-        for t in prange(n_time):
+        for t in range(n_time):
             for i in range(n_lat):
                 for j in range(n_lon):
                     i_start = max(0, i - radius)
@@ -249,13 +249,13 @@ if HAS_NUMBA:
                         result[t, i, j] = min_val
         return result
 
-    @jit(nopython=True, parallel=True, cache=True)
+    @jit(nopython=True, parallel=False, cache=False)
     def _spatial_max_3d_numba(data: np.ndarray, window_size: int, min_periods: int) -> np.ndarray:
         n_time, n_lat, n_lon = data.shape
         result = np.full_like(data, np.nan)
         radius = window_size // 2
 
-        for t in prange(n_time):
+        for t in range(n_time):
             for i in range(n_lat):
                 for j in range(n_lon):
                     i_start = max(0, i - radius)

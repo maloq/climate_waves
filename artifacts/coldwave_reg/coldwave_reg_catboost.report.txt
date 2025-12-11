@@ -1,10 +1,30 @@
-Training Regression Report
+Training Regression Report (Anomaly-based)
+Climatology file: climate_data/target_reg/daily_average_cold.nc
+Binarization threshold: 10.0
+Mode: cold
 
-Regression Metrics:
-Train RMSE: 3.9764
-Val RMSE:   4.4273
-Val MAE:    3.3312
-Val R2:     0.9109
+Regression Metrics (on anomaly):
+Train RMSE: 3.6591
+Val RMSE:   5.0087
+Val MAE:    3.7347
+Val R2:     -0.2632
+
+============================================================
+
+Validation Classification Metrics:
+  Balanced Accuracy: 0.6056
+  Precision:         0.3066
+  Recall:            0.3493
+  F1 Score:          0.3266
+  Specificity:       0.8618
+
+  Confusion Matrix:
+    TN: 3,125,033  FP: 501,072
+    FN: 412,718  TP: 221,589
+
+Training Classification Metrics:
+  Balanced Accuracy: 0.7475
+  F1 Score:          0.5873
 
 ============================================================
 

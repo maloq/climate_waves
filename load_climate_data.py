@@ -14,6 +14,10 @@ import json
 import shutil
 import time
 
+# Thread safety: Use synchronous scheduler to avoid heap corruption from concurrent Blosc/Zarr decompression
+import dask
+dask.config.set(scheduler='synchronous')
+
 # Import helpers from load_data
 from load_data import _subset_region, apply_label_smoothing, load_config
 from feature_engineering import engineer_features
@@ -223,15 +227,43 @@ def load_targets_lazy(
     if not files:
         raise FileNotFoundError("No target files found.")
 
-    # Disable parallel=True here too just to be safe
-    ds = xr.open_mfdataset(files, combine="by_coords", chunks="auto", parallel=False)
+    # Check if files are zarr or netcdf
+    is_zarr = any(f.endswith('.zarr') for f in files)
+    
+    if is_zarr:
+        # Open zarr files individually and concatenate
+        datasets = []
+        for f in files:
+            ds_single = xr.open_zarr(f, chunks="auto")
+            
+            # Standardize time coordinate name BEFORE concatenation
+            if "date" in ds_single.coords:
+                ds_single = ds_single.rename({"date": "time"})
+            if "valid_time" in ds_single.coords:
+                ds_single = ds_single.rename({"valid_time": "time"})
+            
+            # Ensure 'time' is a dimension, not just a coordinate
+            # This is crucial for zarr files where time might be stored differently
+            if 'time' in ds_single.coords and 'time' not in ds_single.dims:
+                # Time is a coordinate but not a dimension - need to expand
+                ds_single = ds_single.expand_dims('time')
+            
+            datasets.append(ds_single)
+        
+        # Use combine_by_coords which handles overlapping/sequential time coordinates better
+        ds = xr.combine_by_coords(datasets, combine_attrs="override")
+    else:
+        # Use open_mfdataset for netcdf files
+        ds = xr.open_mfdataset(files, combine="by_coords", chunks="auto", parallel=False)
     
     if "date" in ds.coords: ds = ds.rename({"date": "time"})
     if "valid_time" in ds.coords: ds = ds.rename({"valid_time": "time"})
     
     # --- FIX: Ensure Unique Target Time Index ---
-    _, index = np.unique(ds['time'], return_index=True)
-    ds = ds.isel(time=index)
+    if 'time' in ds.dims and ds['time'].size > 0:
+        _, index = np.unique(ds['time'].values, return_index=True)
+        index = np.sort(index)  # Preserve time ordering
+        ds = ds.isel(time=index)
     # --------------------------------------------
 
     ds = _subset_region(ds, lat_range, lon_range)
