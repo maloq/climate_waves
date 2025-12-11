@@ -8,7 +8,7 @@ data:
   longitude_range: [30.0, 120.0]
   train_years: [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023]
   test_years: [2022, 2023, 2024]
-  sample_fraction: 0.01
+  sample_fraction: 0.06
   random_seed: 42
   interpolate: false
 
