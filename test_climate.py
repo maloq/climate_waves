@@ -75,6 +75,11 @@ def load_regression_predictions(
     preds_df["lon_key"] = (preds_df["longitude"] * 100).round().astype(int)
     preds_df["date_key"] = preds_df["time"].dt.date
     
+    # Drop duplicates to ensure unique keys (take first occurrence)
+    preds_df = preds_df.drop_duplicates(subset=["lat_key", "lon_key", "date_key"], keep="first")
+    if verbose:
+        print(f"  [Reg Predictions] Unique prediction entries: {len(preds_df):,}")
+    
     # Create same keys for meta
     meta_lookup = meta.copy()
     meta_lookup["time"] = pd.to_datetime(meta_lookup["time"])
@@ -83,12 +88,20 @@ def load_regression_predictions(
     meta_lookup["date_key"] = meta_lookup["time"].dt.date
     meta_lookup["_idx"] = np.arange(len(meta_lookup))
     
+    n_meta = len(meta_lookup)
+    
     # Merge
     merged = meta_lookup.merge(
         preds_df[["lat_key", "lon_key", "date_key", "reg_pred_anomaly"]],
         on=["lat_key", "lon_key", "date_key"],
         how="left"
     )
+    
+    # Handle potential duplicates from merge (shouldn't happen after drop_duplicates, but safety check)
+    if len(merged) > n_meta:
+        if verbose:
+            print(f"  [Reg Predictions] Warning: Merge created duplicates ({len(merged)} vs {n_meta}), taking first match")
+        merged = merged.drop_duplicates(subset=["_idx"], keep="first")
     
     # Sort back to original order
     merged = merged.sort_values("_idx")
@@ -280,7 +293,7 @@ def calculate_relaxed_metrics(y_true, y_pred, y_proba, meta, year):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate trained model on holdout years (New Climate Source)")
-    parser.add_argument("--config", default="configs/config_climate_coldwave_local.yaml", help="Path to config YAML")
+    parser.add_argument("--config", default="configs/config_climate_coldwave.yaml", help="Path to config YAML")
     args = parser.parse_args()
 
     config = load_config(args.config)

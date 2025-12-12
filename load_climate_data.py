@@ -24,14 +24,96 @@ from feature_engineering import engineer_features
 
 CACHE_DIR = pathlib.Path("cache/climate_data")
 CACHE_LIMIT_GB = 130
+CACHE_FORMAT_VERSION = 2
 
-def get_config_hash(config: Dict, years: List[int]) -> str:
+
+def _atomic_write_parquet(df: pd.DataFrame, path: pathlib.Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    df.to_parquet(tmp_path, index=False)
+    tmp_path.replace(path)
+
+
+def _month_cache_path(cache_subdir: pathlib.Path, year: int, month: int) -> pathlib.Path:
+    return cache_subdir / "monthly" / str(year) / f"{month:02d}.parquet"
+
+
+def _dataset_to_dataframe_fast(
+    ds: xr.Dataset,
+    *,
+    target_var: str,
+    time_dim: str = "time",
+    lat_dim: str = "latitude",
+    lon_dim: str = "longitude",
+) -> pd.DataFrame:
+    """
+    Faster alternative to `ds.to_dataframe().reset_index()` for common (time, lat, lon) grids.
+
+    - Avoids MultiIndex creation
+    - Avoids global dropna() (we only drop rows with missing target)
+    """
+    for dim in (time_dim, lat_dim, lon_dim):
+        if dim not in ds.dims:
+            raise KeyError(f"Expected dim '{dim}' in dataset dims {tuple(ds.dims)}")
+    if target_var not in ds.data_vars:
+        raise KeyError(f"Target var '{target_var}' not found in dataset vars {list(ds.data_vars)}")
+
+    time_vals = ds[time_dim].values
+    lat_vals = ds[lat_dim].values
+    lon_vals = ds[lon_dim].values
+
+    n_time = time_vals.size
+    n_lat = lat_vals.size
+    n_lon = lon_vals.size
+
+    n_grid = n_lat * n_lon
+    n_rows = n_time * n_grid
+
+    # Coordinate columns (match C-order flattening of (time, lat, lon))
+    time_col = np.repeat(time_vals, n_grid)
+    lat_col = np.tile(np.repeat(lat_vals, n_lon), n_time)
+    lon_col = np.tile(lon_vals, n_time * n_lat)
+
+    # Build mask: target must be finite (labels cannot be NaN)
+    target_da = ds[target_var]
+    if target_da.dims != (time_dim, lat_dim, lon_dim):
+        target_da = target_da.transpose(time_dim, lat_dim, lon_dim)
+    y_flat = np.asarray(target_da.values).reshape(n_rows)
+    keep = np.isfinite(y_flat)
+
+    cols: dict[str, np.ndarray] = {
+        "time": time_col[keep],
+        "latitude": lat_col[keep],
+        "longitude": lon_col[keep],
+        target_var: y_flat[keep].astype(np.float32, copy=False),
+    }
+
+    for var in ds.data_vars:
+        if var == target_var:
+            continue
+        da = ds[var]
+        # Only support scalar fields on the same grid
+        if da.ndim != 3 or time_dim not in da.dims or lat_dim not in da.dims or lon_dim not in da.dims:
+            # Skip unexpected shapes (keeps behavior robust; downstream will warn on missing vars if needed)
+            continue
+        if da.dims != (time_dim, lat_dim, lon_dim):
+            da = da.transpose(time_dim, lat_dim, lon_dim)
+        flat = np.asarray(da.values).reshape(n_rows)
+        cols[var] = flat[keep].astype(np.float32, copy=False) if flat.dtype.kind == "f" else flat[keep]
+
+    return pd.DataFrame(cols)
+
+def get_config_hash(config: Dict, years: List[int], runtime: Dict | None = None) -> str:
     """Generates a stable hash for the data configuration + specific years."""
     # Create a simplified config dictionary containing only data-relevant parts
     relevant_config = {
+        "cache_format_version": CACHE_FORMAT_VERSION,
         "features": sorted(config.get("features", [])),
-        "data": {k: v for k, v in config.get("data", {}).items() if k not in ["train_years", "test_years", "random_seed", "sample_fraction"]},
+        # Include sample_fraction/random_seed/subsampling so caches are invalidated when they change.
+        "data": {k: v for k, v in config.get("data", {}).items() if k not in ["train_years", "test_years"]},
         "feature_engineering": config.get("feature_engineering", {}),
+        "label_smoothing": config.get("label_smoothing", {}),
+        "runtime": runtime or {},
         "years": sorted(years)
     }
     
@@ -295,6 +377,11 @@ def load_years(
     sample_fraction = kwargs.get("sample_fraction", data_cfg.get("sample_fraction", 1.0))
     random_seed = kwargs.get("random_seed", data_cfg.get("random_seed", 42))
     target_var = data_cfg["target_var"]
+    subsampling_cfg = data_cfg.get("subsampling", {}) or {}
+    subsampling_mode = str(subsampling_cfg.get("mode", "")).strip().lower()
+    tail_preserving_enabled = subsampling_mode in ("tail_preserving", "tail-preserving", "tail_preserve", "tail-preserve")
+    tail_positive_threshold = subsampling_cfg.get("positive_threshold", None)
+    tail_near_miss_threshold = subsampling_cfg.get("near_miss_threshold", None)
 
     # Check if label smoothing is enabled
     ls_config = config.get("label_smoothing", {})
@@ -321,20 +408,67 @@ def load_years(
         df_chunk[target_var] = y_smooth
         if verbose: print("done.")
         return df_chunk
-    
-    # --- Caching Setup ---
-    cache_subdir = None
-    if use_cache:
-        # Hash logic must be very robust. We hash the config relevant to data processing + list of years.
-        # Actually, caching per year is better, so we can reuse years across experiments.
-        # So the hash should depend on config but NOT the list of years requested (we'll look up year by year).
-        config_hash = get_config_hash(config, []) # Empty list for base config hash
-        cache_subdir = CACHE_DIR / config_hash
-        cache_subdir.mkdir(parents=True, exist_ok=True)
-        if verbose: print(f"Cache Directory: {cache_subdir}")
-    # ---------------------
 
-    # 1. Calc Buffer
+    def _tail_preserving_subsample_chunk(
+        df_chunk: pd.DataFrame,
+        *,
+        year: int,
+        month: int,
+    ) -> pd.DataFrame:
+        """
+        Tail-preserving subsampling:
+        - Keep all positives (>= positive_threshold)
+        - Optionally keep all near-misses (>= near_miss_threshold)
+        - Subsample remaining negatives to reach approx sample_fraction
+        """
+        nonlocal tail_positive_threshold, tail_near_miss_threshold
+
+        if not tail_preserving_enabled:
+            return df_chunk
+        if tail_positive_threshold is None:
+            raise ValueError(
+                "data.subsampling.positive_threshold must be set when tail-preserving subsampling is enabled."
+            )
+        if target_var not in df_chunk.columns:
+            raise KeyError(f"Target column '{target_var}' missing from chunk; cannot tail-preserve.")
+
+        n_total = len(df_chunk)
+        if n_total == 0:
+            return df_chunk
+
+        n_target = int(n_total * sample_fraction)
+        n_target = max(n_target, 1)
+
+        y = df_chunk[target_var]
+        keep_mask = y >= float(tail_positive_threshold)
+        if tail_near_miss_threshold is not None:
+            keep_mask = keep_mask | (y >= float(tail_near_miss_threshold))
+
+        df_keep = df_chunk.loc[keep_mask]
+        df_rest = df_chunk.loc[~keep_mask]
+
+        n_keep = len(df_keep)
+        n_needed = max(n_target - n_keep, 0)
+
+        # Deterministic per (year, month) seed
+        chunk_seed = int(random_seed) + (int(year) * 100) + int(month)
+
+        if n_needed <= 0 or df_rest.empty:
+            out = df_keep if n_keep > 0 else df_chunk.sample(n=n_target, random_state=chunk_seed)
+        else:
+            n_sample = min(n_needed, len(df_rest))
+            df_sampled = df_rest.sample(n=n_sample, random_state=chunk_seed)
+            out = pd.concat([df_keep, df_sampled], axis=0, ignore_index=True)
+
+        # Keep a deterministic stable order for temporal splits/inspection
+        sort_cols = [c for c in ["time", "latitude", "longitude"] if c in out.columns]
+        if sort_cols:
+            out = out.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+        else:
+            out = out.reset_index(drop=True)
+        return out
+    
+    # 1. Calc Buffer / FE enabled
     fe_config = config.get("feature_engineering", {})
     fe_enabled = fe_config.get("enabled", True) and apply_feature_engineering
     buffer_days = 0
@@ -345,6 +479,26 @@ def load_years(
         if "temporal_diff" in fe_config: lookbacks.extend(fe_config["temporal_diff"].get("periods", []))
         buffer_days = max(lookbacks) + 5
 
+    # --- Caching Setup ---
+    cache_subdir = None
+    if use_cache:
+        # Hash logic must be very robust. We hash the config relevant to data processing.
+        # The hash should depend on config but NOT the list of years requested (year/month are part of cache path).
+        config_hash = get_config_hash(
+            config,
+            [],
+            runtime={
+                "apply_feature_engineering": bool(fe_enabled),
+                "apply_label_smoothing": bool(ls_enabled),
+                "effective_sample_fraction": float(sample_fraction),
+                "effective_random_seed": int(random_seed),
+            },
+        )
+        cache_subdir = CACHE_DIR / config_hash
+        cache_subdir.mkdir(parents=True, exist_ok=True)
+        if verbose: print(f"Cache Directory: {cache_subdir}")
+    # ---------------------
+
     lat_range = tuple(data_cfg["latitude_range"])
     lon_range = tuple(data_cfg["longitude_range"])
     variables = config["features"]
@@ -354,34 +508,69 @@ def load_years(
     processed_dfs = []
     
     # 2. Try Loading from Cache
+    year_dfs_map: dict[int, list[pd.DataFrame]] = {int(yr): [] for yr in years}
+    months_needed_map: dict[int, set[int]] = {}
+
     if use_cache:
         for yr in years:
-            cache_file = cache_subdir / f"{yr}.parquet"
-            if cache_file.exists():
-                if verbose: print(f"  [Cache] Loading {yr}...", end=" ", flush=True)
-                try:
-                     # Touch the file to update mtime for LRU eviction
-                    cache_file.touch()
-                    df_year = pd.read_parquet(cache_file)
-                    
-                    if ls_enabled:
-                         try:
-                             df_year = _apply_chunk_smoothing(df_year)
-                         except Exception as e:
-                             print(f"Warning: Label smoothing failed for cached year {yr}: {e}")
+            yr = int(yr)
+            loaded_months = 0
+            missing_months: set[int] = set()
 
-                    if sample_fraction < 1.0 and not df_year.empty:
-                        df_year = df_year.sample(frac=sample_fraction, random_state=random_seed)
-                    
-                    processed_dfs.append(df_year)
-                    if verbose: print(f"done. ({len(df_year):,} rows)")
-                except Exception as e:
-                    print(f"Error loading cache for {yr}: {e}. Will recompute.")
-                    years_to_compute.append(yr)
-            else:
+            for m in range(1, 13):
+                cache_file = _month_cache_path(cache_subdir, yr, m)
+                if cache_file.exists():
+                    if verbose:
+                        print(f"  [Cache] Loading {yr}-{m:02d}...", end=" ", flush=True)
+                    try:
+                        cache_file.touch()
+                        df_month = pd.read_parquet(cache_file)
+                        year_dfs_map[yr].append(df_month)
+                        loaded_months += 1
+                        if verbose:
+                            print(f"done. ({len(df_month):,} rows)")
+                    except Exception as e:
+                        print(f"Error loading monthly cache for {yr}-{m:02d}: {e}. Will recompute month.")
+                        missing_months.add(m)
+                else:
+                    missing_months.add(m)
+
+            # If we found no monthly cache at all, fall back to legacy yearly cache (if it exists)
+            if loaded_months == 0:
+                legacy_cache_file = cache_subdir / f"{yr}.parquet"
+                if legacy_cache_file.exists():
+                    if verbose:
+                        print(f"  [Cache] Loading legacy {yr}...", end=" ", flush=True)
+                    try:
+                        legacy_cache_file.touch()
+                        df_year = pd.read_parquet(legacy_cache_file)
+                        if ls_enabled and not df_year.empty:
+                            try:
+                                df_year = _apply_chunk_smoothing(df_year)
+                            except Exception as e:
+                                print(f"Warning: Label smoothing failed for cached year {yr}: {e}")
+                        if sample_fraction < 1.0 and not df_year.empty:
+                            if tail_preserving_enabled:
+                                # Legacy cache doesn't preserve tails; force recompute instead of sampling blindly
+                                raise RuntimeError("Legacy yearly cache is incompatible with tail-preserving sampling.")
+                            df_year = df_year.sample(frac=sample_fraction, random_state=random_seed)
+                        year_dfs_map[yr].append(df_year)
+                        if verbose:
+                            print(f"done. ({len(df_year):,} rows)")
+                        continue
+                    except Exception as e:
+                        print(f"Error loading legacy cache for {yr}: {e}. Will recompute.")
+
+                months_needed_map[yr] = set(range(1, 13))
+                years_to_compute.append(yr)
+                continue
+
+            if missing_months:
+                months_needed_map[yr] = missing_months
                 years_to_compute.append(yr)
     else:
-        years_to_compute = years
+        years_to_compute = list(map(int, years))
+        months_needed_map = {int(yr): set(range(1, 13)) for yr in years_to_compute}
 
     # 3. Open Global Datasets (Lazy) - ONLY if we have years to compute
     if years_to_compute:
@@ -442,6 +631,23 @@ def load_years(
         ds_targets_global = load_targets_lazy(
             years_to_compute, data_cfg["target_dir"], data_cfg["target_file_template"], lat_range, lon_range
         )
+
+        # If the expected target variable name is missing, fall back to the single available one.
+        # This guards against mismatches between the config `target_var` and the actual variable
+        # stored in the Zarr/NetCDF files (e.g. config expects `target_wind_gust_p95` but files
+        # contain `target_gust_p95`).
+        if target_var not in ds_targets_global.data_vars:
+            target_candidates = list(ds_targets_global.data_vars)
+            if len(target_candidates) == 1:
+                alt_var = target_candidates[0]
+                if verbose:
+                    print(f"  [Target] '{target_var}' not found, using '{alt_var}' instead.")
+                ds_targets_global = ds_targets_global.rename({alt_var: target_var})
+            else:
+                raise KeyError(
+                    f"Target variable '{target_var}' not found in loaded target data. "
+                    f"Available variables: {target_candidates}"
+                )
 
         manage_cache_size() # Pre-emptive clean
 
@@ -517,6 +723,16 @@ def load_years(
             # we iterate by month (or chunks), convert, subsample, and accumulate.
             
             year_dfs = []
+            sampling_stats = {
+                "total_before": 0,
+                "pos_before": 0,
+                "total_after": 0,
+                "pos_after": 0,
+                "kept_pos": 0,
+                "kept_near": 0,
+                "sampled_other": 0,
+            }
+            months_needed = months_needed_map.get(int(yr), set(range(1, 13)))
             
             # Group by month usually works well for climate data
             # Use 'time.month' for grouping or just a simple split
@@ -524,16 +740,31 @@ def load_years(
             # but standard selection is safer.
             
             months = np.unique(ds_merged['time'].dt.month)
+            present_months = {int(x) for x in months.tolist()}
+            if use_cache:
+                # Write empty sentinels for months with no data so we don't attempt recomputation every run.
+                for missing_m in sorted(months_needed - present_months):
+                    cache_file = _month_cache_path(cache_subdir, int(yr), int(missing_m))
+                    try:
+                        _atomic_write_parquet(
+                            pd.DataFrame(columns=["time", "latitude", "longitude", target_var]),
+                            cache_file,
+                        )
+                    except Exception as e:
+                        print(f"  [Cache] Failed to write empty monthly cache {cache_file}: {e}")
             for m in months:
+                m = int(m)
+                if m not in months_needed:
+                    continue
                 ds_month = ds_merged.sel(time=ds_merged['time'].dt.month == m)
                 
                 if ds_month.time.size == 0: continue
                 
                 try:
-                    df_chunk = ds_month.to_dataframe().reset_index().dropna()
+                    df_chunk = _dataset_to_dataframe_fast(ds_month, target_var=target_var)
                 except MemoryError:
                     print(f"    [Memory] Month {m} too large, trying compute()...")
-                    df_chunk = ds_month.compute().to_dataframe().reset_index().dropna()
+                    df_chunk = _dataset_to_dataframe_fast(ds_month.compute(), target_var=target_var)
                 
                 # F. Label Smoothing (Per chunk)
                 if ls_enabled and not df_chunk.empty:
@@ -541,68 +772,86 @@ def load_years(
                      
                 # G. Subsample (Per chunk)
                 if sample_fraction < 1.0 and not df_chunk.empty:
-                    df_chunk = df_chunk.sample(frac=sample_fraction, random_state=random_seed)
+                    if tail_preserving_enabled:
+                        # Track before/after class balance for this chunk
+                        sampling_stats["total_before"] += len(df_chunk)
+                        pos_before = int((df_chunk[target_var] >= float(tail_positive_threshold)).sum())
+                        sampling_stats["pos_before"] += pos_before
+
+                        if tail_near_miss_threshold is not None:
+                            keep_near = (df_chunk[target_var] >= float(tail_near_miss_threshold)) & (
+                                df_chunk[target_var] < float(tail_positive_threshold)
+                            )
+                            sampling_stats["kept_near"] += int(keep_near.sum())
+
+                        keep_pos = df_chunk[target_var] >= float(tail_positive_threshold)
+                        sampling_stats["kept_pos"] += int(keep_pos.sum())
+
+                        df_chunk = _tail_preserving_subsample_chunk(df_chunk, year=int(yr), month=int(m))
+
+                        sampling_stats["total_after"] += len(df_chunk)
+                        sampling_stats["pos_after"] += int((df_chunk[target_var] >= float(tail_positive_threshold)).sum())
+                        # sampled_other is "everything that's not kept_pos/kept_near" in the final set
+                        sampling_stats["sampled_other"] = sampling_stats["total_after"] - sampling_stats["kept_pos"] - sampling_stats["kept_near"]
+                    else:
+                        df_chunk = df_chunk.sample(frac=sample_fraction, random_state=random_seed)
                     
                 if not df_chunk.empty:
                     year_dfs.append(df_chunk)
+                    if use_cache:
+                        cache_file = _month_cache_path(cache_subdir, int(yr), int(m))
+                        try:
+                            _atomic_write_parquet(df_chunk, cache_file)
+                        except Exception as e:
+                            print(f"  [Cache] Failed to write monthly cache {cache_file}: {e}")
                 
                 del ds_month, df_chunk
                 
             if year_dfs:
-                df_year = pd.concat(year_dfs, axis=0, ignore_index=True)
-            else:
-                df_year = pd.DataFrame()
+                year_dfs_map[int(yr)].extend(year_dfs)
 
-            # E. Save to Cache (Yearly level)
-            # Reconstruct full year DF for cache if needed - WAIT. 
-            # Caching subsampled data loses information. We usually cache the FULL data.
-            # But if we only want to train on subsampled, maybe we should cache subsampled?
-            # The original code cached BEFORE subsampling.
-            # To preserve that behavior without exploding RAM, we'd need to save chunks to disk and then specific logic.
-            # For now, let's DISABLE caching of the full dataframe OR accept that we are caching the *subsampled* result if we want to save space?
-            # Original code:
-            #   E. Save to Cache
-            #   F. Smoothing
-            #   G. Subsample
-            #
-            # If I want to keep exact behavior safely:
-            # it's hard because saving the huge file to parquet requires holding it in memory or fancy appending.
-            #
-            # Alternative: Since valid/train caches are separate by hash, and hash doesn't include sample_fraction currently?
-            # Hash includes 'data' config. `sample_fraction` is EXCLUDED from hash in `get_config_hash`.
-            # So cache MUST contain full data.
-            #
-            # If we want to support caching 100% data, we must write chunks to parquet.
-            # Fastparquet/PyArrow allow appending?
-            # Simpler: Write separate monthly cache files? Complex.
-            #
-            # Safe Compromise: Skip caching for this run if memory is tight, OR just cache the subsampled version IF we accept it breaks reuse for different sample_fractions.
-            # But the user complained about CRASHING.
-            # Let's skip writing to cache in this optimized path to be essentially safe, 
-            # or write the combined df_year ONLY if it fits. 
-            # But we just built `df_year` which is subsampled.
-            # So we effectively can't cache the full data without holding it.
-            # Redesign:
-            # We will NOT cache the result in this limited RAM mode for now to ensure stability.
-            # OR we accept that we only return the subsampled data.
-            
-            processed_dfs.append(df_year)
-            
-            del ds_merged, ds_chunk_feat, ds_chunk_target, df_year
+            del ds_merged, ds_chunk_feat, ds_chunk_target
             gc.collect()
             
-            if verbose: print(f"done. ({len(processed_dfs[-1]):,} rows)")
+            if verbose:
+                added_rows = sum(len(d) for d in year_dfs) if year_dfs else 0
+                print(f"done. (+{added_rows:,} rows)")
+
+            if verbose and sample_fraction < 1.0 and tail_preserving_enabled:
+                tb = sampling_stats["total_before"]
+                ta = sampling_stats["total_after"]
+                pb = sampling_stats["pos_before"]
+                pa = sampling_stats["pos_after"]
+                if tb > 0 and ta > 0:
+                    print(
+                        "  [Subsampling:tail_preserving] "
+                        f"year={yr} threshold>={tail_positive_threshold} "
+                        f"before: n={tb:,} pos={pb:,} ({100.0*pb/tb:.3f}%) | "
+                        f"after: n={ta:,} pos={pa:,} ({100.0*pa/ta:.3f}%) | "
+                        f"kept_pos={sampling_stats['kept_pos']:,} kept_near={sampling_stats['kept_near']:,} "
+                        f"sampled_other={sampling_stats['sampled_other']:,}"
+                    )
 
     # 5. Final Concat
-    if not processed_dfs:
+    all_parts: list[pd.DataFrame] = []
+    for yr in years:
+        all_parts.extend(year_dfs_map[int(yr)])
+    if not all_parts:
         raise ValueError("No data loaded for any year!")
-        
+
     if verbose: print("  Concatenating years...", end=" ", flush=True)
-    df_final = pd.concat(processed_dfs, axis=0, ignore_index=True)
+    df_final = pd.concat(all_parts, axis=0, ignore_index=True)
     if verbose: print(f"done. Total shape: {df_final.shape}")
     
     # 6. Extract X, y
     target_var = data_cfg["target_var"]
+    if target_var not in df_final.columns:
+        target_candidates = [c for c in df_final.columns if "target" in c]
+        raise KeyError(
+            f"Target column '{target_var}' missing after processing. "
+            f"Available target-like columns: {target_candidates}"
+        )
+
     y = df_final[target_var].copy()
     meta = df_final[["time", "latitude", "longitude"]].copy()
     

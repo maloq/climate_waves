@@ -667,6 +667,13 @@ def test_model(config: Dict) -> None:
     output_cfg = config["output"]
     bin_cfg = config.get("binarization", {})
     bin_cmp_cfg = config.get("binary_comparison", {})
+
+    # Always evaluate on full test data (no subsampling)
+    if data_cfg.get("sample_fraction", 1.0) < 1.0:
+        print(
+            f"Overriding sample_fraction from {data_cfg.get('sample_fraction')} to 1.0 for evaluation."
+        )
+        data_cfg["sample_fraction"] = 1.0
     
     print(f"\nTest years: {data_cfg['test_years']}")
     print(f"Loading model from: {output_cfg['model_path']}")

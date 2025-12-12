@@ -779,6 +779,75 @@ def compute_daily_climatology_anomalies(
 
 
 # =============================================================================
+# WIND (10M) PHYSICS FEATURES
+# =============================================================================
+
+def compute_wind10_speed_direction(
+    ds: xr.Dataset,
+    u_var: str = "u10",
+    v_var: str = "v10",
+    speed_name: str = "wind10_speed",
+    dir_sin_name: str = "wind10_dir_sin",
+    dir_cos_name: str = "wind10_dir_cos",
+    eps: float = 1e-6,
+) -> xr.Dataset:
+    """Compute 10m wind speed and a continuous direction encoding.
+
+    Direction is encoded as normalized components (sin/cos surrogate):
+      dir_cos = u / (speed + eps), dir_sin = v / (speed + eps)
+    which avoids atan2 discontinuities and is numerically stable.
+    """
+    if u_var not in ds.data_vars or v_var not in ds.data_vars:
+        warnings.warn(f"Missing wind components ({u_var}, {v_var}), skipping wind10 speed/direction")
+        return ds
+
+    U = ds[u_var]
+    V = ds[v_var]
+    speed = np.hypot(U, V)
+    denom = speed + eps
+
+    return ds.assign(
+        **{
+            speed_name: speed,
+            dir_cos_name: U / denom,
+            dir_sin_name: V / denom,
+        }
+    )
+
+
+def compute_wind10_divergence_vorticity(
+    ds: xr.Dataset,
+    u_var: str = "u10",
+    v_var: str = "v10",
+    divergence_name: str = "wind10_div",
+    vorticity_name: str = "wind10_vort",
+) -> xr.Dataset:
+    """Compute cheap divergence/vorticity proxies from spatial gradients.
+
+    Uses the precomputed gradient features:
+      du/dx ≈ u_grad_lon, du/dy ≈ u_grad_lat
+      dv/dx ≈ v_grad_lon, dv/dy ≈ v_grad_lat
+
+    Divergence: du/dx + dv/dy
+    Vorticity (vertical): dv/dx - du/dy
+    """
+    u_grad_lon = f"{u_var}_grad_lon"
+    u_grad_lat = f"{u_var}_grad_lat"
+    v_grad_lon = f"{v_var}_grad_lon"
+    v_grad_lat = f"{v_var}_grad_lat"
+
+    missing = [c for c in [u_grad_lon, u_grad_lat, v_grad_lon, v_grad_lat] if c not in ds.data_vars]
+    if missing:
+        warnings.warn(f"Missing gradient vars {missing}, skipping wind10 div/vort")
+        return ds
+
+    div = ds[u_grad_lon] + ds[v_grad_lat]
+    vort = ds[v_grad_lon] - ds[u_grad_lat]
+
+    return ds.assign(**{divergence_name: div, vorticity_name: vort})
+
+
+# =============================================================================
 # WIND CHILL INDEX
 # =============================================================================
 
@@ -1242,6 +1311,19 @@ def engineer_features(
             include_sin_cos_annual=temporal_cfg.get("sin_cos_annual", True),
             include_sin_cos_semiannual=temporal_cfg.get("sin_cos_semiannual", False),
         )
+
+    # 0b. Wind physics (speed/direction) so derived vars can be lagged/diffed
+    if "wind_physics" in config:
+        wp_cfg = config["wind_physics"] or {}
+        if wp_cfg.get("enabled", False):
+            result = compute_wind10_speed_direction(
+                result,
+                u_var=wp_cfg.get("u_var", "u10"),
+                v_var=wp_cfg.get("v_var", "v10"),
+                speed_name=wp_cfg.get("speed_name", "wind10_speed"),
+                dir_sin_name=wp_cfg.get("dir_sin_name", "wind10_dir_sin"),
+                dir_cos_name=wp_cfg.get("dir_cos_name", "wind10_dir_cos"),
+            )
     
     # 1. Lag features
     if "lag" in config:
@@ -1284,6 +1366,18 @@ def engineer_features(
             lat_dim=lat_dim,
             lon_dim=lon_dim,
         )
+
+    # 4b. Wind physics (div/vort) requires gradients
+    if "wind_physics" in config:
+        wp_cfg = config["wind_physics"] or {}
+        if wp_cfg.get("enabled", False) and wp_cfg.get("div_vort", True):
+            result = compute_wind10_divergence_vorticity(
+                result,
+                u_var=wp_cfg.get("u_var", "u10"),
+                v_var=wp_cfg.get("v_var", "v10"),
+                divergence_name=wp_cfg.get("divergence_name", "wind10_div"),
+                vorticity_name=wp_cfg.get("vorticity_name", "wind10_vort"),
+            )
     
     # 5. Temporal differences
     if "temporal_diff" in config:
@@ -1296,8 +1390,18 @@ def engineer_features(
         )
     
     # 6. Climatology Anomalies
+    # Preferred: config["climatology"]; Back-compat: config["temporal_diff"]["climatology"]
+    clim_cfg = None
     if "climatology" in config:
         clim_cfg = config["climatology"]
+    elif isinstance(config.get("temporal_diff", None), dict) and "climatology" in config["temporal_diff"]:
+        warnings.warn(
+            "feature_engineering.climatology should be a top-level key; "
+            "found feature_engineering.temporal_diff.climatology (back-compat path)."
+        )
+        clim_cfg = config["temporal_diff"]["climatology"]
+
+    if clim_cfg is not None:
         result = compute_daily_climatology_anomalies(
             result,
             variables=clim_cfg.get("variables", []),
@@ -1449,6 +1553,7 @@ def get_feature_names(
         List of all feature names (original + engineered)
     """
     names = list(base_features)
+    available = set(base_features)
     
     # Temporal/seasonality features
     if "temporal" in config:
@@ -1463,36 +1568,65 @@ def get_feature_names(
         if temporal_cfg.get("sin_cos_semiannual", False):
             names.append("sin_semiannual")
             names.append("cos_semiannual")
+
+    # Derived wind physics features should be considered "available" for downstream lags/diffs
+    if "wind_physics" in config and (config["wind_physics"] or {}).get("enabled", False):
+        wp_cfg = config["wind_physics"] or {}
+        u_var = wp_cfg.get("u_var", "u10")
+        v_var = wp_cfg.get("v_var", "v10")
+        if u_var in available and v_var in available:
+            speed_name = wp_cfg.get("speed_name", "wind10_speed")
+            dir_sin_name = wp_cfg.get("dir_sin_name", "wind10_dir_sin")
+            dir_cos_name = wp_cfg.get("dir_cos_name", "wind10_dir_cos")
+
+            for n in [speed_name, dir_sin_name, dir_cos_name]:
+                if n not in names:
+                    names.append(n)
+                available.add(n)
     
     if "lag" in config:
         for var in config["lag"].get("variables", []):
-            if var in base_features:
+            if var in available:
                 for lag in config["lag"].get("lags", []):
                     names.append(f"{var}_lag{lag}")
     
     if "ewm" in config:
         for var in config["ewm"].get("variables", []):
-            if var in base_features:
+            if var in available:
                 for span in config["ewm"].get("spans", []):
                     names.append(f"{var}_ewm{span}")
     
     if "spatial" in config:
         for var in config["spatial"].get("variables", []):
-            if var in base_features:
+            if var in available:
                 for window in config["spatial"].get("window_sizes", []):
                     for stat in config["spatial"].get("stats", ["mean", "std"]):
                         names.append(f"{var}_{stat}{window}")
     
     if "gradients" in config:
         for var in config["gradients"].get("variables", []):
-            if var in base_features:
+            if var in available:
                 names.append(f"{var}_grad_lat")
                 names.append(f"{var}_grad_lon")
                 names.append(f"{var}_grad_mag")
-    
+        # Wind div/vort depend on gradients existing
+        if "wind_physics" in config and (config["wind_physics"] or {}).get("enabled", False):
+            wp_cfg = config["wind_physics"] or {}
+            if wp_cfg.get("div_vort", True):
+                u_var = wp_cfg.get("u_var", "u10")
+                v_var = wp_cfg.get("v_var", "v10")
+                grad_vars = set(config.get("gradients", {}).get("variables", []))
+                if u_var in grad_vars and v_var in grad_vars:
+                    divergence_name = wp_cfg.get("divergence_name", "wind10_div")
+                    vorticity_name = wp_cfg.get("vorticity_name", "wind10_vort")
+                    for n in [divergence_name, vorticity_name]:
+                        if n not in names:
+                            names.append(n)
+                        available.add(n)
+
     if "temporal_diff" in config:
         for var in config["temporal_diff"].get("variables", []):
-            if var in base_features:
+            if var in available:
                 for period in config["temporal_diff"].get("periods", []):
                     names.append(f"{var}_diff{period}")
     
@@ -1501,9 +1635,15 @@ def get_feature_names(
             if var in base_features:
                 names.append(f"{var}_anom")
     
+    clim_cfg = None
     if "climatology" in config:
-        for var in config["climatology"].get("variables", []):
-            if var in base_features:
+        clim_cfg = config["climatology"]
+    elif isinstance(config.get("temporal_diff", None), dict) and "climatology" in config["temporal_diff"]:
+        clim_cfg = config["temporal_diff"]["climatology"]
+
+    if clim_cfg is not None:
+        for var in clim_cfg.get("variables", []):
+            if var in available:
                 names.append(f"{var}_anom")
 
     if "wind_chill" in config:
@@ -1521,4 +1661,3 @@ def get_feature_names(
                     names.append(f"{var}_global_{stat}")
 
     return names
-

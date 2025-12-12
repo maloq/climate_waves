@@ -122,11 +122,11 @@ feature_engineering:
       # - temperature_h00_lvl1000
       # - v_component_of_wind_h00_lvl1000
     periods: [1, 3, 7, 14]
-
-    climatology:
-      variables:
-        - t2m
-      path: climate_data/climatology.nc
+  
+  climatology:
+    variables:
+      - t2m
+    path: climate_data/climatology.nc
 
   wind_chill:
     enabled: true

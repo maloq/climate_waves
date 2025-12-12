@@ -10,6 +10,10 @@ data:
   test_years: [2022, 2023, 2024]
   sample_fraction: 0.06
   random_seed: 42
+  subsampling:
+    mode: tail_preserving
+    positive_threshold: 21.0
+    near_miss_threshold: 18.0
   interpolate: false
 
 features:
@@ -29,14 +33,18 @@ feature_engineering:
     sin_cos_annual: true
     sin_cos_semiannual: false
 
-  # lag:
-  #   variables:
-  #     - t2m
-  #     - u10
-  #     - v10
-  #     - tp
-  #     - msl
-  #   lags: [1, 2, 3, 5, 7]
+  wind_physics:
+    enabled: true
+    u_var: u10
+    v_var: v10
+
+  lag:
+    variables:
+      - u10
+      - v10
+      - wind10_speed
+      - msl
+    lags: [1, 2, 3]
 
   ewm:
     variables:
@@ -44,6 +52,7 @@ feature_engineering:
       - tp
       - u10
       - v10
+      - wind10_speed
       - msl
 
     spans: [3, 7, 14]
@@ -65,17 +74,19 @@ feature_engineering:
       - u10
       - v10
       - msl
-      - sd
   temporal_diff:
     variables:
       - t2m
       - msl
-    periods: [1, 3, 7, 14]
+      - u10
+      - v10
+      - wind10_speed
+    periods: [1, 2, 3, 7, 14]
 
-    climatology:
-      variables:
-        - t2m
-      path: climate_data/climatology.nc
+  climatology:
+    variables:
+      - t2m
+    path: climate_data/climatology.nc
 
   wind_chill:
     enabled: true
@@ -115,8 +126,8 @@ training:
   shuffle: false
 
 output:
-  model_path: artifacts/coldwave_reg/coldwave_reg_catboost.cbm
-  predictions_dir: artifacts/coldwave_reg/predictions
+  model_path: artifacts/wind_reg/wind_reg_catboost.cbm
+  predictions_dir: artifacts/wind_reg/predictions
 
 binarization:
   enabled: true
